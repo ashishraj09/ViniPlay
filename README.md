@@ -55,6 +55,7 @@ The server-side backend resolves common CORS and browser compatibility issues by
  - 🎥 **DVR**: Record programs using FFMPEG. Schedule recording via the TV Guide, or set specific channels and time with ease.
  - 📽️ **Single player**: Play .m3u8 and .ts links directly from the browser, with detailed console logs and recorded history
  - 👥 **Admin monitoring page**: Monitor users watch stream in real time, store historical plays, and broadcast messages to all users.
+ - 📺 **VODs support**: Play your VODs from your provider, divided cleanly in the UI with a scalable grid, with filters and tabs for Movies and Series (IMPORTANT: this only workd with XC API log in)
 ---
 
 
@@ -180,6 +181,7 @@ The project is organized into a Node.js backend and a modular vanilla JavaScript
 
 Upcoming features and fixes include:
 
+-   Add VODs support for M3U links and File uploads  
 -   Making DVR .ts files seekable during recording.
 -   Storing logos to improve load time.
 -   Implementing full horizontal scroll in the TV Guide.
