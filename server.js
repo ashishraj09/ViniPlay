@@ -21,6 +21,11 @@ const webpush = require('web-push');
 const schedule = require('node-schedule');
 const disk = require('diskusage');
 const si = require('systeminformation'); // NEW: For system health monitoring
+//vod processor
+const { refreshVodContent, processM3uVod } = require('./vodProcessor');
+const XtreamClient = require('./xtreamClient');
+
+
 // --- NEW: Live Activity Tracking for Redirects ---
 const activeRedirectStreams = new Map(); // Tracks live redirect streams for the admin UI
 
@@ -50,10 +55,13 @@ const DATA_DIR = '/data';
 const DVR_DIR = '/dvr';
 const VAPID_KEYS_PATH = path.join(DATA_DIR, 'vapid.json');
 const SOURCES_DIR = path.join(DATA_DIR, 'sources');
+const RAW_CACHE_DIR = path.join(SOURCES_DIR, 'raw_cache');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const DB_PATH = path.join(DATA_DIR, 'viniplay.db');
-const MERGED_M3U_PATH = path.join(DATA_DIR, 'playlist.m3u');
-const MERGED_EPG_JSON_PATH = path.join(DATA_DIR, 'epg.json');
+const LIVE_CHANNELS_M3U_PATH = path.join(DATA_DIR, 'live_channels.m3u'); // Renamed
+const LIVE_EPG_JSON_PATH = path.join(DATA_DIR, 'epg.json'); // Renamed
+const VOD_MOVIES_JSON_PATH = path.join(DATA_DIR, 'vod_movies.json'); // New
+const VOD_SERIES_JSON_PATH = path.join(DATA_DIR, 'vod_series.json'); // New
 const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
 
 console.log(`[INIT] Application starting. Data directory: ${DATA_DIR}, Public directory: ${PUBLIC_DIR}`);
@@ -83,6 +91,7 @@ try {
     if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
     if (!fs.existsSync(SOURCES_DIR)) fs.mkdirSync(SOURCES_DIR, { recursive: true });
     if (!fs.existsSync(DVR_DIR)) fs.mkdirSync(DVR_DIR, { recursive: true });
+    if (!fs.existsSync(RAW_CACHE_DIR)) fs.mkdirSync(RAW_CACHE_DIR, { recursive: true });
     console.log(`[INIT] All required directories checked/created.`);
 } catch (mkdirError) {
     console.error(`[INIT] FATAL: Failed to create necessary directories: ${mkdirError.message}`);
@@ -112,9 +121,106 @@ const db = new sqlite3.Database(DB_PATH, (err) => {
             db.run(`CREATE TABLE IF NOT EXISTS notification_deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, notification_id INTEGER NOT NULL, subscription_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', updatedAt TEXT NOT NULL, FOREIGN KEY (notification_id) REFERENCES notifications(id) ON DELETE CASCADE, FOREIGN KEY (subscription_id) REFERENCES push_subscriptions(id) ON DELETE CASCADE)`);
             db.run(`CREATE TABLE IF NOT EXISTS dvr_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, channelId TEXT NOT NULL, channelName TEXT NOT NULL, programTitle TEXT NOT NULL, startTime TEXT NOT NULL, endTime TEXT NOT NULL, status TEXT NOT NULL, ffmpeg_pid INTEGER, filePath TEXT, profileId TEXT, userAgentId TEXT, preBufferMinutes INTEGER, postBufferMinutes INTEGER, errorMessage TEXT, isConflicting INTEGER DEFAULT 0, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)`);
             db.run(`CREATE TABLE IF NOT EXISTS dvr_recordings (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, user_id INTEGER NOT NULL, channelName TEXT NOT NULL, programTitle TEXT NOT NULL, startTime TEXT NOT NULL, durationSeconds INTEGER, fileSizeBytes INTEGER, filePath TEXT UNIQUE NOT NULL, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY (job_id) REFERENCES dvr_jobs(id) ON DELETE SET NULL)`);
+
+            // --- NEW: VOD Tables ---
+            db.run(`CREATE TABLE IF NOT EXISTS movies (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL,
+				year INTEGER,
+				description TEXT,
+				logo TEXT,
+				tmdb_id TEXT,
+				imdb_id TEXT,
+				category_name TEXT,
+				provider_unique_id TEXT UNIQUE,
+				created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+				updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+			)`, (err) => { if (err) console.error("[DB] Error creating 'movies' table:", err.message); });
+			
+			db.run(`CREATE TABLE IF NOT EXISTS series (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL,
+				year INTEGER,
+				description TEXT,
+				logo TEXT,
+				tmdb_id TEXT,
+				imdb_id TEXT,
+				category_name TEXT,
+				provider_unique_id TEXT UNIQUE,
+				created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+				updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+			)`, (err) => { if (err) console.error("[DB] Error creating 'series' table:", err.message); });
+            
+            db.run(`CREATE TABLE IF NOT EXISTS episodes (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				series_id INTEGER NOT NULL,
+				season_num INTEGER NOT NULL,
+				episode_num INTEGER NOT NULL,
+				name TEXT,
+				description TEXT,
+				air_date TEXT,
+				tmdb_id TEXT,
+				imdb_id TEXT,
+				created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+				updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE
+			)`, (err) => { if (err) console.error("[DB] Error creating 'episodes' table:", err.message); });
+            
+            db.run(`CREATE TABLE IF NOT EXISTS vod_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id TEXT UNIQUE NOT NULL,
+                category_name TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )`, (err) => { if (err) console.error("[DB] Error creating 'vod_categories' table:", err.message); });
+            
+            // --- NEW: VOD Relation Tables (Linking Providers to Content) ---
+            // Note: Assuming 'provider_id' refers to the ID of the M3U source entry in settings
+            // We'll store the source ID (e.g., 'src-12345678') as TEXT for flexibility
+            db.run(`CREATE TABLE IF NOT EXISTS provider_movie_relations (
+                provider_id TEXT NOT NULL,
+                movie_id INTEGER NOT NULL,
+                stream_id TEXT NOT NULL,
+                container_extension TEXT,
+                last_seen TEXT NOT NULL,
+                FOREIGN KEY (movie_id) REFERENCES movies(id) ON DELETE CASCADE,
+                PRIMARY KEY (provider_id, stream_id)
+            )`, (err) => { if (err) console.error("[DB] Error creating 'provider_movie_relations' table:", err.message); });
+            
+            db.run(`CREATE TABLE IF NOT EXISTS provider_series_relations (
+                provider_id TEXT NOT NULL,
+                series_id INTEGER NOT NULL,
+                external_series_id TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE,
+                PRIMARY KEY (provider_id, external_series_id)
+            )`, (err) => { if (err) console.error("[DB] Error creating 'provider_series_relations' table:", err.message); });
+            
+             db.run(`CREATE TABLE IF NOT EXISTS provider_episode_relations (
+                provider_id TEXT NOT NULL,
+                episode_id INTEGER NOT NULL,
+                provider_stream_id TEXT NOT NULL, -- The stream ID for the episode from XC
+                last_seen TEXT NOT NULL,
+                FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE,
+                PRIMARY KEY (provider_id, episode_id)
+             )`, (err) => { if (err) console.error("[DB] Error creating 'provider_episode_relations' table:", err.message); });
+            // --- END NEW VOD TABLES ---
             
             //-- ENHANCEMENT: Modify stream history table to include more data for the admin panel.
-            db.run(`CREATE TABLE IF NOT EXISTS stream_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, username TEXT NOT NULL, channel_id TEXT, channel_name TEXT, start_time TEXT NOT NULL, end_time TEXT, duration_seconds INTEGER, status TEXT NOT NULL, client_ip TEXT, channel_logo TEXT, stream_profile_name TEXT)`, (err) => {
+            db.run(`CREATE TABLE IF NOT EXISTS stream_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                channel_id TEXT,
+                channel_name TEXT,
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                duration_seconds INTEGER,
+                status TEXT NOT NULL,
+                client_ip TEXT,
+                channel_logo TEXT,
+                stream_profile_name TEXT
+            )`, (err) => {
                 if (!err) {
                     // Add new columns non-destructively if the table already exists
                     db.run("ALTER TABLE stream_history ADD COLUMN channel_logo TEXT", () => {});
@@ -207,6 +313,56 @@ function sendProcessingStatus(req, message, type = 'info') {
     }
 }
 
+// --- Database Helper Functions ---
+/**
+ * Promisified version of db.run
+ * @param {sqlite3.Database} db - The database instance.
+ * @param {string} sql - The SQL query.
+ * @param {Array} params - Query parameters.
+ * @returns {Promise<object>} - { lastID, changes }
+ */
+const dbRun = (db, sql, params = []) => {
+    return new Promise((resolve, reject) => {
+        db.run(sql, params, function (err) {
+            if (err) return reject(err);
+            resolve(this);
+        });
+    });
+};
+
+/**
+ * Promisified version of db.get
+ * @param {sqlite3.Database} db - The database instance.
+ * @param {string} sql - The SQL query.
+ * @param {Array} params - Query parameters.
+ * @returns {Promise<object|null>} - The first row found.
+ */
+const dbGet = (db, sql, params = []) => {
+    return new Promise((resolve, reject) => {
+        db.get(sql, params, (err, row) => {
+            if (err) return reject(err);
+            resolve(row);
+        });
+    });
+};
+
+/**
+ * Promisified version of db.all
+ * @param {sqlite3.Database} db - The database instance.
+ * @param {string} sql - The SQL query.
+ * @param {Array} params - Query parameters.
+ * @returns {Promise<Array>} - An array of rows.
+ */
+const dbAll = (db, sql, params = []) => {
+    return new Promise((resolve, reject) => {
+        db.all(sql, params, (err, rows) => {
+            if (err) return reject(err);
+            resolve(rows);
+        });
+    });
+};
+// --- End Database Helper Functions ---
+
 
 /**
  * NEW: Detects available hardware for transcoding.
@@ -224,22 +380,42 @@ async function detectHardwareAcceleration() {
         }
     });
 
-    // MODIFIED: Use 'vainfo' for more robust detection of Intel VA-API and QSV
+    // MODIFIED: Use 'vainfo' with enhanced logging
     exec('vainfo', (err, stdout, stderr) => {
-        if (err || stderr) {
-            console.log('[HW] VA-API not detected or vainfo command failed.');
+        // Log the raw output regardless of error
+        console.log(`[HW_DEBUG] vainfo stdout:\n${stdout}`);
+        console.error(`[HW_DEBUG] vainfo stderr:\n${stderr}`);
+
+        if (err) {
+            console.error('[HW] Error executing vainfo:', err); // Log the actual error object
+            console.error('[HW] vainfo command failed. VA-API/QSV detection skipped.');
             detectedHardware.intel_qsv = null;
             detectedHardware.intel_vaapi = null;
+        } else if (stderr) {
+            // Sometimes vainfo prints errors to stderr even if it doesn't return an error code
+            console.warn(`[HW] vainfo reported errors/warnings to stderr, but executed successfully. VA-API/QSV detection might be unreliable.`);
+            // Proceed with detection but be aware it might be partial
+            if (stdout.includes('iHD_drv_video.so')) {
+                detectedHardware.intel_qsv = 'Intel Quick Sync Video';
+                console.log('[HW] Intel QSV (iHD driver) detected via VA-API (despite stderr warnings).');
+            }
+            if (stdout.includes('i965_drv_video.so')) {
+                detectedHardware.intel_vaapi = 'Intel VA-API (Legacy)';
+                console.log('[HW] Intel VA-API (i965 driver) detected (despite stderr warnings).');
+            }
         } else {
-            // iHD driver is for modern Intel GPUs (Gen9+) and is preferred for QSV
+            // Success case (no error, no stderr)
+            console.log('[HW] vainfo executed successfully.');
             if (stdout.includes('iHD_drv_video.so')) {
                 detectedHardware.intel_qsv = 'Intel Quick Sync Video';
                 console.log('[HW] Intel QSV (iHD driver) detected via VA-API.');
             }
-            // i965 driver is for older Intel GPUs (pre-Gen9)
             if (stdout.includes('i965_drv_video.so')) {
                 detectedHardware.intel_vaapi = 'Intel VA-API (Legacy)';
                 console.log('[HW] Intel VA-API (i965 driver) detected.');
+            }
+             if (!detectedHardware.intel_qsv && !detectedHardware.intel_vaapi) {
+                 console.log('[HW] vainfo ran, but no known Intel drivers (iHD or i965) were found in the output.');
             }
         }
     });
@@ -446,6 +622,34 @@ function getSettings() {
     }
 }
 
+/**
+ * Initiates the VOD refresh process for a given XC provider.
+ * @param {object} provider - The M3U source object (must be type 'xc').
+ * @param {sqlite3.Database} dbInstance - The active database connection.
+ * @param {function} sendStatus - Function to send status updates.
+ */
+async function triggerVodRefreshForProvider(provider, dbInstance, sendStatus = () => {}) {
+    if (!provider || provider.type !== 'xc' || !provider.xc_data) {
+        console.error(`[VOD Trigger] Invalid provider object passed for VOD refresh. ID: ${provider?.id}`);
+        return;
+    }
+
+    console.log(`[VOD Trigger] Starting VOD refresh for provider: ${provider.name} (ID: ${provider.id})`);
+    sendStatus(`Triggering VOD refresh for ${provider.name}...`, 'info');
+
+    try {
+        // Call the main processing function from vodProcessor.js
+        await refreshVodContent(dbInstance, dbGet, dbAll, dbRun, provider, sendStatus);
+
+        console.log(`[VOD Trigger] Successfully finished VOD refresh for provider: ${provider.name}`);
+
+    } catch (error) {
+        console.error(`[VOD Trigger] Error during VOD refresh for ${provider.name}: ${error.message}`);
+        sendStatus(`VOD refresh FAILED for ${provider.name}: ${error.message}`, 'error');
+    }
+}
+
+
 // ... existing helper functions (saveSettings, fetchUrlContent, parseEpgTime, processAndMergeSources, updateAndScheduleSourceRefreshes) remain the same ...
 function saveSettings(settings) {
     try {
@@ -518,28 +722,43 @@ const parseEpgTime = (timeStr, offsetHours = 0) => {
     return date;
 };
 
-// server.js -> Replace the entire function with this corrected version
-
-async function processAndMergeSources(req) { // <-- MODIFIED
+async function processAndMergeSources(req) {
     console.log('[PROCESS] Starting to process and merge all active sources.');
-    sendProcessingStatus(req, 'Starting to process sources...', 'info'); // <-- NEW
+    sendProcessingStatus(req, 'Starting to process sources...', 'info');
     const settings = getSettings();
 
-    let mergedM3uContent = '#EXTM3U\n';
+    // --- NEW: Data holders for separated content ---
+    let mergedLiveM3uContent = '#EXTM3U\n';
+    //let mergedVodMovies = [];
+    //let mergedVodSeries = [];
+    let liveChannelIdSet = new Set(); // To track which channels need EPG
+    const groupTitleRegex = /group-title="([^"]*)"/;
+    // ---
+
     const activeM3uSources = settings.m3uSources.filter(s => s.isActive);
     const activeEpgSources = settings.epgSources.filter(s => s.isActive);
 
     if (activeM3uSources.length === 0) {
         console.log('[PROCESS] No active M3U sources found.');
-        sendProcessingStatus(req, 'No active M3U sources found.', 'info'); // <-- NEW
+        sendProcessingStatus(req, 'No active M3U sources found.', 'info');
     }
 
     for (const source of activeM3uSources) {
         console.log(`[M3U] Processing source: "${source.name}" (ID: ${source.id}, Type: ${source.type}, Path: ${source.path})`);
-        sendProcessingStatus(req, `Processing M3U source: "${source.name}"...`, 'info'); // <-- NEW
+        sendProcessingStatus(req, `Processing M3U source: "${source.name}"...`, 'info');
+
+        // --- NEW: Group Filter Logic ---
+        const selectedGroups = source.selectedGroups || [];
+        const isGroupFilteringActive = selectedGroups.length > 0;
+        if (isGroupFilteringActive) {
+            sendProcessingStatus(req, ` -> Applying group filter. ${selectedGroups.length} groups selected.`, 'info');
+        }
+        // ---
+
         try {
             let content = '';
             let sourcePathForLog = source.path;
+            let m3uFetchOptions = {}; // NEW: For XC User-Agent
 
             if (source.type === 'file') {
                 const sourceFilePath = path.join(SOURCES_DIR, path.basename(source.path));
@@ -547,16 +766,34 @@ async function processAndMergeSources(req) { // <-- MODIFIED
                     content = fs.readFileSync(sourceFilePath, 'utf-8');
                     sourcePathForLog = sourceFilePath;
                 } else {
-                    const errorMsg = `File not found for source "${source.name}". Skipping.`; // <-- NEW
-                    sendProcessingStatus(req, `Error: ${errorMsg}`, 'error'); // <-- NEW
+                    const errorMsg = `File not found for source "${source.name}". Skipping.`;
+                    sendProcessingStatus(req, `Error: ${errorMsg}`, 'error');
                     source.status = 'Error';
                     source.statusMessage = 'File not found.';
                     continue;
                 }
             } else if (source.type === 'url') {
-                sendProcessingStatus(req, ` -> Fetching content from URL...`, 'info'); // <-- NEW
+                sendProcessingStatus(req, ` -> Fetching content from URL...`, 'info');
                 content = await fetchUrlContent(source.path);
-                sendProcessingStatus(req, ` -> Successfully fetched M3U content.`, 'info'); // <-- NEW
+                // Save raw content to cache (URL) ---
+                try {
+                    // Define cache path (ensure it's unique per source)
+                    const cacheFileName = `raw_${source.id}.m3u_cache`; // Use a distinct extension
+                    const cacheFilePath = path.join(RAW_CACHE_DIR, cacheFileName);
+
+                    // Write the fetched content to the cache file
+                    fs.writeFileSync(cacheFilePath, content);
+                    console.log(`[PROCESS_CACHE] Saved raw content for source "${source.name}" to ${cacheFilePath}`);
+
+                    // Store the path in the source object (this will be saved later when settings are saved)
+                    source.cachedRawPath = cacheFilePath;
+
+                } catch (cacheWriteError) {
+                    console.error(`[PROCESS_CACHE] Failed to write raw cache for source "${source.name}" (URL):`, cacheWriteError.message);
+                    // Clear any potentially stale cache path if writing failed
+                    delete source.cachedRawPath;
+                }
+                sendProcessingStatus(req, ` -> Successfully fetched M3U content.`, 'info');
             } else if (source.type === 'xc') {
                 if (!source.xc_data) {
                     throw new Error("XC source is missing credential data (xc_data).");
@@ -568,15 +805,32 @@ async function processAndMergeSources(req) { // <-- MODIFIED
                     throw new Error("XC source is missing server, username, or password.");
                 }
 
-                const fetchOptions = {
-                    headers: { 'User-Agent': 'VLC/3.0.20 (Linux; x86_64)' }
-                };
+                // Use the default user agent for XC requests
+                m3uFetchOptions = { headers: { 'User-Agent': 'VLC/3.0.20 (Linux; x86_64)' } };
                 const m3uUrl = `${server}/get.php?username=${username}&password=${password}&type=m3u_plus&output=ts`;
                 console.log(`[M3U] Constructed XC URL for "${source.name}": ${m3uUrl}`);
-                sendProcessingStatus(req, ` -> Fetching content from XC server...`, 'info'); // <-- NEW
-                content = await fetchUrlContent(m3uUrl, fetchOptions);
+                sendProcessingStatus(req, ` -> Fetching content from XC server...`, 'info');
+                content = await fetchUrlContent(m3uUrl, m3uFetchOptions);
+                // Save raw content to cache (XC) ---
+                try {
+                    // Define cache path (ensure it's unique per source)
+                    const cacheFileName = `raw_${source.id}.m3u_cache`; // Use a distinct extension
+                    const cacheFilePath = path.join(RAW_CACHE_DIR, cacheFileName);
+
+                    // Write the fetched content to the cache file
+                    fs.writeFileSync(cacheFilePath, content);
+                    console.log(`[PROCESS_CACHE] Saved raw content for source "${source.name}" to ${cacheFilePath}`);
+
+                    // Store the path in the source object (this will be saved later when settings are saved)
+                    source.cachedRawPath = cacheFilePath;
+
+                } catch (cacheWriteError) {
+                    console.error(`[PROCESS_CACHE] Failed to write raw cache for source "${source.name}" (XC):`, cacheWriteError.message);
+                    // Clear any potentially stale cache path if writing failed
+                    delete source.cachedRawPath;
+                }
                 sourcePathForLog = m3uUrl;
-                sendProcessingStatus(req, ` -> Successfully fetched M3U content from XC server.`, 'info'); // <-- NEW
+                sendProcessingStatus(req, ` -> Successfully fetched M3U content from XC server.`, 'info');
 
                 const epgUrl = `${server}/xmltv.php?username=${username}&password=${password}`;
                 const epgSource = {
@@ -586,83 +840,132 @@ async function processAndMergeSources(req) { // <-- MODIFIED
                     path: epgUrl,
                     isActive: true,
                     isXcEpg: true,
-                    fetchOptions: fetchOptions
+                    fetchOptions: m3uFetchOptions // Pass fetch options to EPG
                 };
 
                 if (!activeEpgSources.some(s => s.id === epgSource.id)) {
                     activeEpgSources.push(epgSource);
-                    sendProcessingStatus(req, ` -> Automatically added EPG source for "${source.name}".`, 'info'); // <-- NEW
+                    sendProcessingStatus(req, ` -> Automatically added EPG source for "${source.name}".`, 'info');
                 }
             }
 
+            // --- NEW: Trigger VOD Refresh for all non-XC Sources ---
+            if (source.type === 'file' || source.type === 'url') {
+                console.log(`[PROCESS] Source "${source.name}" is a non-XC M3U. Triggering VOD processing.`);
+                sendProcessingStatus(req, ` -> Triggering VOD content processing for M3U source "${source.name}"...`, 'info');
+                await processM3uVod(db, dbGet, dbAll, dbRun, content, source, (msg, type) => sendProcessingStatus(req, msg, type));
+            }
+            // --- END VOD Trigger ---
+
             const lines = content.split('\n');
-            let processedContent = '';
-            let streamCount = 0; // <-- NEW
+            let currentExtInf = '';
+            let liveStreamCount = 0;
+            let movieCount = 0;
+            let seriesCount = 0;
+
             for (let i = 0; i < lines.length; i++) {
                 let line = lines[i].trim();
                 if (line.startsWith('#EXTINF:')) {
-                    streamCount++; // <-- NEW
-                    const tvgIdMatch = line.match(/tvg-id="([^"]*)"/);
-                    const tvgId = tvgIdMatch ? tvgIdMatch[1] : `no-id-${Math.random()}`;
-                    const uniqueChannelId = `${source.id}_${tvgId}`;
+                    currentExtInf = line;
+                    continue;
+                }
 
-                    const commaIndex = line.lastIndexOf(',');
-                    const attributesPart = commaIndex !== -1 ? line.substring(0, commaIndex) : line;
-                    const namePart = commaIndex !== -1 ? line.substring(commaIndex) : '';
+                if (line.startsWith('http') && currentExtInf) {
+                    const streamUrl = line;
 
-                    let processedAttributes = attributesPart;
-                    if (tvgIdMatch) {
-                        processedAttributes = processedAttributes.replace(/tvg-id="[^"]*"/, `tvg-id="${uniqueChannelId}"`);
+
+
+                    // --- GROUP FILTER LOGIC ---
+                    const groupMatch = currentExtInf.match(groupTitleRegex);
+                    const groupTitle = (groupMatch && groupMatch[1]) ? groupMatch[1] : 'Uncategorized';
+                    if (isGroupFilteringActive && !selectedGroups.includes(groupTitle)) {
+                        currentExtInf = ''; // Reset for next entry
+                        continue; // Skip this entry - not in selected groups
+                    }
+                    // --- END GROUP FILTER ---
+
+                    // --- LIVE CHANNEL PROCESSING (Only Live Channels here now) ---
+                    liveStreamCount++;
+                    let processedExtInf = currentExtInf;
+                    const idMatch = currentExtInf.match(/tvg-id="([^"]*)"/); // Still needed for unique ID
+                    const nameMatch = line.match(/tvg-name="([^"]*)"/); // Get name if available
+                    const commaIndex = currentExtInf.lastIndexOf(',');
+                    const name = nameMatch ? nameMatch[1] : ((commaIndex !== -1) ? currentExtInf.substring(commaIndex + 1).trim() : 'Unknown');
+
+                    // Consistent Unique Channel ID Generation
+                    const originalTvgId = idMatch ? idMatch[1] : `no-tvg-id-${name.replace(/[^a-zA-Z0-9]/g, '')}`;
+                    const finalUniqueChannelId = `${source.id}_${originalTvgId}`;
+
+                    // Inject the *corrected* unique ID into the #EXTINF line
+                    if (idMatch) {
+                        processedExtInf = processedExtInf.replace(/tvg-id="[^"]*"/, `tvg-id="${finalUniqueChannelId}"`);
                     } else {
-                        const extinfEnd = processedAttributes.indexOf(' ') + 1;
-                        processedAttributes = processedAttributes.slice(0, extinfEnd) + `tvg-id="${uniqueChannelId}" ` + processedAttributes.slice(extinfEnd);
+                        const extinfEnd = processedExtInf.indexOf(':') + 1;
+                        processedExtInf = processedExtInf.slice(0, extinfEnd) + ` tvg-id="${finalUniqueChannelId}"` + processedExtInf.slice(extinfEnd);
                     }
 
-                    processedAttributes += ` vini-source="${source.name}"`;
-                    line = processedAttributes + namePart;
-                }
-                if (line) {
-                   processedContent += line + '\n';
+                    // Inject source name
+                    const tvgIdAttrEnd = processedExtInf.indexOf(`tvg-id="${finalUniqueChannelId}"`) + `tvg-id="${finalUniqueChannelId}"`.length;
+                    processedExtInf = processedExtInf.slice(0, tvgIdAttrEnd) + ` vini-source="${source.name}"` + processedExtInf.slice(tvgIdAttrEnd);
+
+                    mergedLiveM3uContent += processedExtInf + '\n' + streamUrl + '\n';
+                    liveChannelIdSet.add(finalUniqueChannelId);
+                    // --- END LIVE CHANNEL PROCESSING ---
+
+                    currentExtInf = ''; // Reset for next entry
                 }
             }
 
-            mergedM3uContent += processedContent.replace(/#EXTM3U/i, '') + '\n';
             source.status = 'Success';
-            source.statusMessage = `Processed ${streamCount} streams successfully.`; // <-- CORRECT, DYNAMIC VERSION
+            source.statusMessage = `Processed ${liveStreamCount} Live channels.`;
             console.log(`[M3U] Source "${source.name}" processed successfully from ${sourcePathForLog}.`);
-            sendProcessingStatus(req, ` -> Processed ${streamCount} streams from "${source.name}".`, 'info'); // <-- NEW
+            sendProcessingStatus(req, ` -> Processed ${liveStreamCount} Live channels from "${source.name}".`, 'info');
+
+            // --- NEW: Trigger VOD Refresh for XC Sources ---
+            if (source.type === 'xc') {
+                console.log(`[PROCESS] Source "${source.name}" is XC. Triggering VOD refresh.`);
+                sendProcessingStatus(req, ` -> Triggering VOD content refresh for XC source "${source.name}"...`, 'info');
+                // Use setImmediate to run the VOD refresh *after* the current M3U processing finishes
+                // Pass the source object and the global db instance
+                await triggerVodRefreshForProvider(source, db, (msg, type) => sendProcessingStatus(req, msg, type));
+            }
+            // --- END VOD Trigger ---
 
         } catch (error) {
-            const errorMsg = `Failed to process source "${source.name}" from ${source.path}: ${error.message}`; // <-- NEW
-            console.error(`[M3U] ${errorMsg}`); // <-- MODIFIED
-            sendProcessingStatus(req, `Error: ${errorMsg}`, 'error'); // <-- NEW
+            const errorMsg = `Failed to process source "${source.name}" from ${source.path}: ${error.message}`;
+            console.error(`[M3U] ${errorMsg}`);
+            sendProcessingStatus(req, `Error: ${errorMsg}`, 'error');
             source.status = 'Error';
             source.statusMessage = `Processing failed: ${error.message.substring(0, 100)}...`;
         }
         source.lastUpdated = new Date().toISOString();
     }
-    try {
-        fs.writeFileSync(MERGED_M3U_PATH, mergedM3uContent);
-        console.log(`[M3U] Merged M3U content saved to ${MERGED_M3U_PATH}.`);
-        sendProcessingStatus(req, `Successfully merged all M3U sources.`, 'success'); // <-- NEW
-    } catch (writeErr) {
-        console.error(`[M3U] Error writing merged M3U file: ${writeErr.message}`);
-        sendProcessingStatus(req, `Error writing merged M3U file: ${writeErr.message}`, 'error'); // <-- NEW
-    }
 
+    // --- Save the new separated files ---
+    try { // Try block for saving LIVE M3U
+        fs.writeFileSync(LIVE_CHANNELS_M3U_PATH, mergedLiveM3uContent);
+        console.log(`[M3U] Merged LIVE CHANNELS content saved to ${LIVE_CHANNELS_M3U_PATH}.`);
+        sendProcessingStatus(req, `Successfully merged all live channels.`, 'success');
+    } catch (writeErr) { // Catch block for saving LIVE M3U
+        console.error(`[PROCESS] Error writing LIVE M3U file: ${writeErr.message}`);
+        sendProcessingStatus(req, `Error writing live channels file: ${writeErr.message}`, 'error');
+    }
+    // <<<--- THE ORPHANED CATCH BLOCK WAS REMOVED FROM HERE --->>>
+
+    // --- EPG Processing (now filtered) ---
     const mergedProgramData = {};
     const timezoneOffset = settings.timezoneOffset || 0;
 
     if (activeEpgSources.length === 0) {
         console.log('[PROCESS] No active EPG sources found.');
-        sendProcessingStatus(req, 'No active EPG sources found.', 'info'); // <-- NEW
+        sendProcessingStatus(req, 'No active EPG sources found.', 'info');
     }
 
     for (const source of activeEpgSources) {
         if (!source.isActive && !source.isXcEpg) continue;
 
         console.log(`[EPG] Processing source: "${source.name}" (ID: ${source.id}, Type: ${source.type}, Path: ${source.path})`);
-        sendProcessingStatus(req, `Processing EPG source: "${source.name}"...`, 'info'); // <-- NEW
+        sendProcessingStatus(req, `Processing EPG source: "${source.name}"...`, 'info');
         try {
             let xmlString = '';
             let epgFilePath = path.join(SOURCES_DIR, `epg_${source.id}.xml`);
@@ -671,16 +974,16 @@ async function processAndMergeSources(req) { // <-- MODIFIED
                 if (fs.existsSync(source.path)) {
                     xmlString = fs.readFileSync(source.path, 'utf-8');
                 } else {
-                    const errorMsg = `File not found for source "${source.name}". Skipping.`; // <-- NEW
-                    sendProcessingStatus(req, `Error: ${errorMsg}`, 'error'); // <-- NEW
+                    const errorMsg = `File not found for source "${source.name}". Skipping.`;
+                    sendProcessingStatus(req, `Error: ${errorMsg}`, 'error');
                     source.status = 'Error';
                     source.statusMessage = 'File not found.';
                     continue;
                 }
             } else if (source.type === 'url') {
-                sendProcessingStatus(req, ` -> Fetching content from URL...`, 'info'); // <-- NEW
+                sendProcessingStatus(req, ` -> Fetching content from URL...`, 'info');
                 xmlString = await fetchUrlContent(source.path, source.fetchOptions || {});
-                sendProcessingStatus(req, ` -> Successfully fetched EPG content.`, 'info'); // <-- NEW
+                sendProcessingStatus(req, ` -> Successfully fetched EPG content.`, 'info');
                 try {
                     fs.writeFileSync(epgFilePath, xmlString);
                     console.log(`[EPG] Downloaded EPG for "${source.name}" saved to ${epgFilePath}.`);
@@ -691,9 +994,10 @@ async function processAndMergeSources(req) { // <-- MODIFIED
 
             const epgJson = xmlJS.xml2js(xmlString, { compact: true });
             const programs = epgJson.tv && epgJson.tv.programme ? [].concat(epgJson.tv.programme) : [];
-            let programCount = 0; // <-- NEW
+            let programCount = 0;
+            let epgAddedCount = 0; // NEW: Count only added programs
 
-            if (programs.length === 0) { // <-- NEW
+            if (programs.length === 0) {
                 sendProcessingStatus(req, `Warning: No programs found in "${source.name}".`, 'info');
             }
 
@@ -702,14 +1006,23 @@ async function processAndMergeSources(req) { // <-- MODIFIED
             for (const prog of programs) {
                 const originalChannelId = prog._attributes?.channel;
                 if (!originalChannelId) continue;
-                programCount++; // <-- NEW
+                programCount++;
 
                 for(const m3uSource of m3uSourceProviders) {
                     const uniqueChannelId = `${m3uSource.id}_${originalChannelId}`;
 
+                    // --- NEW: EPG FILTERING ---
+                    // Only add EPG data if the channel is in our live channel list
+                    if (!liveChannelIdSet.has(uniqueChannelId)) {
+                        continue;
+                    }
+                    // ---
+
                     if (!mergedProgramData[uniqueChannelId]) {
                         mergedProgramData[uniqueChannelId] = [];
                     }
+
+                    epgAddedCount++; // Increment count of *added* programs
 
                     const titleNode = prog.title && prog.title._cdata ? prog.title._cdata : (prog.title?._text || 'No Title');
                     const descNode = prog.desc && prog.desc._cdata ? prog.desc._cdata : (prog.desc?._text || '');
@@ -724,15 +1037,15 @@ async function processAndMergeSources(req) { // <-- MODIFIED
             }
             if (!source.isXcEpg) {
                  source.status = 'Success';
-                 source.statusMessage = `Processed ${programCount} programs successfully.`; // <-- MODIFIED
+                 source.statusMessage = `Processed ${programCount} programs, added ${epgAddedCount} to live guide.`;
                  console.log(`[EPG] Source "${source.name}" processed successfully from ${source.path}.`);
             }
-            sendProcessingStatus(req, ` -> Processed ${programCount} programs from "${source.name}".`, 'info'); // <-- NEW
+            sendProcessingStatus(req, ` -> Processed ${programCount} programs, added ${epgAddedCount} to live guide from "${source.name}".`, 'info');
 
         } catch (error) {
-            const errorMsg = `Failed to process source "${source.name}" from ${source.path}: ${error.message}`; // <-- NEW
-            console.error(`[EPG] ${errorMsg}`); // <-- MODIFIED
-            sendProcessingStatus(req, `Error: ${errorMsg}`, 'error'); // <-- NEW
+            const errorMsg = `Failed to process source "${source.name}" from ${source.path}: ${error.message}`;
+            console.error(`[EPG] ${errorMsg}`);
+            sendProcessingStatus(req, `Error: ${errorMsg}`, 'error');
              if (!source.isXcEpg) {
                  source.status = 'Error';
                  source.statusMessage = `Processing failed: ${error.message.substring(0, 100)}...`;
@@ -745,21 +1058,21 @@ async function processAndMergeSources(req) { // <-- MODIFIED
     for (const channelId in mergedProgramData) {
         mergedProgramData[channelId].sort((a, b) => new Date(a.start) - new Date(b.start));
     }
-    try {
-        fs.writeFileSync(MERGED_EPG_JSON_PATH, JSON.stringify(mergedProgramData));
-        console.log(`[EPG] Merged EPG JSON content saved to ${MERGED_EPG_JSON_PATH}.`);
-        sendProcessingStatus(req, `Successfully merged all EPG sources.`, 'success'); // <-- NEW
-    } catch (writeErr) {
+    try { // Try block for saving EPG JSON
+        fs.writeFileSync(LIVE_EPG_JSON_PATH, JSON.stringify(mergedProgramData));
+        console.log(`[EPG] Merged EPG JSON content saved to ${LIVE_EPG_JSON_PATH}.`);
+        sendProcessingStatus(req, `Successfully merged all EPG data for live channels.`, 'success');
+    } catch (writeErr) { // Catch block for saving EPG JSON
         console.error(`[EPG] Error writing merged EPG JSON file: ${writeErr.message}`);
-        sendProcessingStatus(req, `Error writing merged EPG JSON file: ${writeErr.message}`, 'error'); // <-- NEW
+        sendProcessingStatus(req, `Error writing merged EPG JSON file: ${writeErr.message}`, 'error');
     }
 
     settings.sourcesLastUpdated = new Date().toISOString();
     console.log(`[PROCESS] Finished processing. New 'sourcesLastUpdated' timestamp: ${settings.sourcesLastUpdated}`);
-    sendProcessingStatus(req, 'All sources processed successfully!', 'final_success'); // <-- NEW
+    sendProcessingStatus(req, 'All sources processed successfully!', 'final_success');
 
     return { success: true, message: 'Sources merged successfully.', updatedSettings: settings };
-}
+} 
 
 const updateAndScheduleSourceRefreshes = () => {
     console.log('[SCHEDULER] Updating and scheduling all source refreshes...');
@@ -910,6 +1223,118 @@ app.post('/api/auth/logout', (req, res) => {
         console.log(`[AUTH_API] User ${username} logged out. Session destroyed.`);
         res.json({ success: true });
     });
+});
+
+// --- NEW/OPTIMIZED ENDPOINT FOR GROUP FILTERING (with Caching & Refresh) ---
+app.post('/api/sources/fetch-groups', requireAuth, async (req, res) => {
+    // --- ADDITION: Get refresh flag from query or body ---
+    const forceRefresh = req.query.refresh === 'true' || req.body.refresh === true;
+    const { type, url, xc, sourceId } = req.body; // Added sourceId
+    // --- END ADDITION ---
+
+    let fetchUrl;
+    let fetchOptions = {};
+    let content = '';
+    let usedCache = false; // Flag to track if cache was used
+
+    console.log(`[API_GROUPS] Fetching groups for type: ${type}, SourceID: ${sourceId}, Refresh: ${forceRefresh}`);
+
+    try {
+        let sourceToUse = null;
+        if (sourceId) {
+            const settings = getSettings();
+            // Try finding in M3U sources first, then EPG (though unlikely for M3U groups)
+            sourceToUse = settings.m3uSources.find(s => s.id === sourceId) || settings.epgSources.find(s => s.id === sourceId);
+        }
+
+        // --- START CACHE CHECK ---
+        if (!forceRefresh && sourceToUse && sourceToUse.cachedRawPath && fs.existsSync(sourceToUse.cachedRawPath)) {
+            try {
+                console.log(`[API_GROUPS] Using cached raw file: ${sourceToUse.cachedRawPath}`);
+                content = fs.readFileSync(sourceToUse.cachedRawPath, 'utf-8');
+                usedCache = true;
+            } catch (cacheReadError) {
+                console.warn(`[API_GROUPS] Failed to read cache file ${sourceToUse.cachedRawPath}. Will fetch fresh. Error:`, cacheReadError.message);
+                usedCache = false; // Ensure we fetch fresh if cache read fails
+            }
+        }
+        // --- END CACHE CHECK ---
+
+        // --- Fetch if cache wasn't used or refresh was forced ---
+        if (!usedCache) {
+            console.log(`[API_GROUPS] ${forceRefresh ? 'Refresh forced' : 'Cache not used/found'}. Fetching from original source.`);
+            if (type === 'url' && url) {
+                fetchUrl = url;
+                content = await fetchUrlContent(fetchUrl, fetchOptions);
+            } else if (type === 'xc' && xc) {
+                const xcInfo = JSON.parse(xc);
+                if (!xcInfo.server || !xcInfo.username || !xcInfo.password) {
+                    return res.status(400).json({ error: 'XC source requires server, username, and password.' });
+                }
+                fetchUrl = `${xcInfo.server}/get.php?username=${xcInfo.username}&password=${xcInfo.password}&type=m3u_plus&output=ts`;
+                fetchOptions = { headers: { 'User-Agent': 'VLC/3.0.20 (Linux; x86_64)' } };
+                content = await fetchUrlContent(fetchUrl, fetchOptions);
+
+                // --- ADDITION: Update cache if fetched fresh ---
+                if (sourceToUse) { // Only update cache if we know the source object
+                     try {
+                        const cacheFileName = `raw_${sourceToUse.id}.m3u_cache`;
+                        const cacheFilePath = path.join(RAW_CACHE_DIR, cacheFileName);
+                        fs.writeFileSync(cacheFilePath, content);
+                        console.log(`[API_GROUPS] Updated raw cache file during fetch: ${cacheFilePath}`);
+                        sourceToUse.cachedRawPath = cacheFilePath; // Update path in memory
+
+                        // IMPORTANT: Save updated settings back to file
+                        const currentSettings = getSettings(); // Re-get settings to avoid overwriting other changes
+                        const sourceList = sourceToUse.sourceType === 'm3u' ? currentSettings.m3uSources : currentSettings.epgSources; // Assuming sourceType is passed or derivable
+                        const index = sourceList.findIndex(s => s.id === sourceToUse.id);
+                        if (index !== -1) {
+                            sourceList[index].cachedRawPath = cacheFilePath;
+                            saveSettings(currentSettings); // Save the updated path
+                        }
+
+                    } catch (cacheWriteError) {
+                        console.error(`[API_GROUPS] Failed to update raw cache file for source "${sourceToUse.name}" after fresh fetch:`, cacheWriteError.message);
+                    }
+                }
+                // --- END ADDITION ---
+
+            } else if (type === 'file' && url) { // Assuming url holds file path for type file
+                 const filePath = sourceToUse?.path || path.join(SOURCES_DIR, path.basename(url)); // Prefer path from settings if available
+                 if (fs.existsSync(filePath)) {
+                    content = fs.readFileSync(filePath, 'utf-8');
+                 } else {
+                     return res.status(400).json({ error: 'File source path not found or invalid.' });
+                 }
+            } else {
+                return res.status(400).json({ error: 'Valid source details (URL, XC, or File path) are required.' });
+            }
+        }
+        // --- End Fetch Logic ---
+
+
+        // --- Efficiently Extract Groups (Same as before) ---
+        const groups = new Set();
+        const groupRegex = /group-title="([^"]*)"/i;
+        const lines = content.split('\n');
+        console.log(`[API_GROUPS] Scanning ${lines.length} lines for group titles...`);
+        for (const line of lines) {
+            if (line.startsWith('#EXTINF:')) {
+                const match = line.match(groupRegex);
+                if (match && match[1]) {
+                    const groupName = match[1].trim();
+                    if (groupName) groups.add(groupName);
+                }
+            }
+        }
+        const sortedGroups = Array.from(groups).sort((a, b) => a.localeCompare(b));
+        console.log(`[API_GROUPS] Found ${sortedGroups.length} unique groups.`);
+        res.json({ success: true, groups: sortedGroups, usedCache: usedCache }); // Optionally tell frontend if cache was used
+
+    } catch (error) {
+        console.error(`[API_GROUPS] Failed to fetch or parse M3U for groups: ${error.message}`);
+        res.status(500).json({ error: `Failed to fetch or process groups: ${error.message}` });
+    }
 });
 
 app.get('/api/auth/status', (req, res) => {
@@ -1068,27 +1493,55 @@ app.delete('/api/users/:id', requireAdmin, (req, res) => {
 // --- Protected IPTV API Endpoints ---
 app.get('/api/config', requireAuth, (req, res) => {
     try {
-        let config = { m3uContent: null, epgContent: null, settings: {} };
+        // ADDED vodMovies and vodSeries
+        let config = { m3uContent: null, epgContent: null, settings: {}, vodMovies: [], vodSeries: [] };
         let globalSettings = getSettings();
         config.settings = globalSettings;
 
-        if (fs.existsSync(MERGED_M3U_PATH)) {
-            config.m3uContent = fs.readFileSync(MERGED_M3U_PATH, 'utf-8');
-            console.log(`[API] Loaded M3U content from ${MERGED_M3U_PATH}.`);
+        // UPDATED path
+        if (fs.existsSync(LIVE_CHANNELS_M3U_PATH)) {
+            config.m3uContent = fs.readFileSync(LIVE_CHANNELS_M3U_PATH, 'utf-8');
+            console.log(`[API] Loaded M3U content from ${LIVE_CHANNELS_M3U_PATH}.`);
         } else {
-            console.log(`[API] No merged M3U file found at ${MERGED_M3U_PATH}.`);
+            console.log(`[API] No merged M3U file found at ${LIVE_CHANNELS_M3U_PATH}.`);
         }
-        if (fs.existsSync(MERGED_EPG_JSON_PATH)) {
+        
+        // UPDATED path
+        if (fs.existsSync(LIVE_EPG_JSON_PATH)) {
             try {
-                config.epgContent = JSON.parse(fs.readFileSync(MERGED_EPG_JSON_PATH, 'utf-8'));
-                console.log(`[API] Loaded EPG content from ${MERGED_EPG_JSON_PATH}.`);
+                config.epgContent = JSON.parse(fs.readFileSync(LIVE_EPG_JSON_PATH, 'utf-8'));
+                console.log(`[API] Loaded EPG content from ${LIVE_EPG_JSON_PATH}.`);
             } catch (parseError) {
-                console.error(`[API] Error parsing merged EPG JSON from ${MERGED_EPG_JSON_PATH}: ${parseError.message}`);
+                console.error(`[API] Error parsing merged EPG JSON from ${LIVE_EPG_JSON_PATH}: ${parseError.message}`);
                 config.epgContent = {};
             }
         } else {
-            console.log(`[API] No merged EPG JSON file found at ${MERGED_EPG_JSON_PATH}.`);
+            console.log(`[API] No merged EPG JSON file found at ${LIVE_EPG_JSON_PATH}.`);
         }
+
+        // --- NEW: Load VOD Files ---
+        if (fs.existsSync(VOD_MOVIES_JSON_PATH)) {
+            try {
+                config.vodMovies = JSON.parse(fs.readFileSync(VOD_MOVIES_JSON_PATH, 'utf-8'));
+                console.log(`[API] Loaded ${config.vodMovies.length} movies from ${VOD_MOVIES_JSON_PATH}.`);
+            } catch (parseError) {
+                console.error(`[API] Error parsing VOD Movies JSON: ${parseError.message}`);
+            }
+        } else {
+            console.log(`[API] No VOD Movies file found at ${VOD_MOVIES_JSON_PATH}.`);
+        }
+
+        if (fs.existsSync(VOD_SERIES_JSON_PATH)) {
+            try {
+                config.vodSeries = JSON.parse(fs.readFileSync(VOD_SERIES_JSON_PATH, 'utf-8'));
+                console.log(`[API] Loaded ${config.vodSeries.length} series episodes from ${VOD_SERIES_JSON_PATH}.`);
+            } catch (parseError) {
+                console.error(`[API] Error parsing VOD Series JSON: ${parseError.message}`);
+            }
+        } else {
+            console.log(`[API] No VOD Series file found at ${VOD_SERIES_JSON_PATH}.`);
+        }
+        // --- END NEW VOD ---
         
         db.all(`SELECT key, value FROM user_settings WHERE user_id = ?`, [req.session.userId], (err, rows) => {
             if (err) {
@@ -1118,6 +1571,339 @@ app.get('/api/config', requireAuth, (req, res) => {
     }
 });
 
+// --- NEW: VOD Library Endpoint (Reads from DB and builds URLs) ---
+app.get('/api/vod/library', requireAuth, async (req, res) => {
+    console.log('[API_VOD] Request received for /api/vod/library (DB Query)');
+    try {
+        // 1. Get active XC providers from settings
+        const settings = getSettings();
+        const activeXcProviders = settings.m3uSources.filter(s => s.isActive && s.type === 'xc');
+        const providerMap = new Map();
+        activeXcProviders.forEach(p => {
+            try {
+                const xcInfo = JSON.parse(p.xc_data);
+                const url = new URL(xcInfo.server);
+                providerMap.set(p.id, {
+                    baseUrl: `${url.protocol}//${url.host}`,
+                    username: xcInfo.username,
+                    password: xcInfo.password
+                });
+            } catch (e) {
+                console.error(`[API_VOD] Skipping provider ${p.name}, invalid XC data: ${e.message}`);
+            }
+        });
+        const activeProviderIds = Array.from(providerMap.keys());
+        if (activeProviderIds.length === 0) {
+            console.log('[API_VOD] No active XC providers found. Returning empty library.');
+            return res.json({ movies: [], series: [] });
+        }
+        
+        const providerIdPlaceholders = activeProviderIds.map(() => '?').join(',');
+
+        // 2. Fetch all movies from active providers
+        const movieQuery = `
+            SELECT m.provider_unique_id, m.name, m.year, m.description, m.logo, m.tmdb_id, m.imdb_id, m.category_name, r.stream_id, r.container_extension, r.provider_id
+            FROM movies m
+            JOIN provider_movie_relations r ON m.id = r.movie_id
+            WHERE r.provider_id IN (${providerIdPlaceholders})
+            ORDER BY m.name
+        `;
+        const movies = await dbAll(db, movieQuery, activeProviderIds);
+        
+        const processedMovies = movies.map(m => {
+            const provider = providerMap.get(m.provider_id);
+            if (!provider) return null; // Skip if provider is not active
+            const ext = m.container_extension || 'mp4';
+            // Build the full playable URL
+            const url = `${provider.baseUrl}/movie/${provider.username}/${provider.password}/${m.stream_id}.${ext}`;
+            return {
+                id: m.provider_unique_id, // Use the stable provider_unique_id
+                name: m.name,
+                year: m.year,
+                description: m.description,
+                logo: m.logo,
+                tmdb_id: m.tmdb_id,
+                imdb_id: m.imdb_id,
+                url: url, // The all-important URL
+                type: 'movie',
+                group: m.category_name 
+            };
+        }).filter(Boolean); // Filter out null entries
+        console.log(`[API_VOD] Fetched ${processedMovies.length} movies from DB.`);
+
+        // 3. Fetch all series headers from active providers
+        const seriesQuery = `
+            SELECT DISTINCT s.provider_unique_id, s.name, s.year, s.description, s.logo, s.tmdb_id, s.imdb_id, s.category_name
+            FROM series s
+            JOIN provider_series_relations r ON s.id = r.series_id
+            WHERE r.provider_id IN (${providerIdPlaceholders})
+            ORDER BY s.name
+        `;
+        const seriesList = await dbAll(db, seriesQuery, activeProviderIds);
+        console.log(`[API_VOD] Fetched ${seriesList.length} series headers from DB.`);
+
+        // 4. Fetch episodes for each series
+        /*
+        for (const series of seriesList) {
+            const numericSeriesId = parseInt(String(series.id), 10);
+            
+            const episodeQuery = `
+                SELECT e.id, e.season_num, e.episode_num, e.name, e.description, e.air_date, e.tmdb_id,
+                       r.provider_stream_id, r.provider_id
+                FROM episodes e
+                JOIN provider_episode_relations r ON e.id = r.episode_id
+                WHERE e.series_id = ? AND r.provider_id IN (${providerIdPlaceholders})
+                ORDER BY e.season_num, e.episode_num
+            `;
+            const episodes = await dbAll(db, episodeQuery, [numericSeriesId, ...activeProviderIds]);
+
+            // Group episodes by season
+            const seasons = new Map();
+            episodes.forEach(ep => {
+                const provider = providerMap.get(ep.provider_id);
+                if (!provider) return; // Skip episode if its provider is not active
+                
+                const ext = ep.container_extension || 'mp4';
+                // Build the full playable URL
+                const epUrl = `${provider.baseUrl}/series/${provider.username}/${provider.password}/${ep.stream_id}.${ext}`;
+
+                const seasonNum = ep.season_num;
+                if (!seasons.has(seasonNum)) {
+                    seasons.set(seasonNum, []);
+                }
+                seasons.get(seasonNum).push({
+                    id: String(ep.id),
+                    name: ep.name,
+                    description: ep.description,
+                    air_date: ep.air_date,
+                    tmdb_id: ep.tmdb_id,
+                    season: ep.season_num,
+                    episode: ep.episode_num,
+                    url: epUrl // The all-important URL
+                });
+            });
+            
+            // Convert Map to the object structure the frontend expects
+            series.seasons = Object.fromEntries(seasons);
+            series.type = 'series'; // Add type
+            series.id = String(series.id); // Ensure string ID
+            series.group = series.category_name
+        }
+
+        console.log(`[API_VOD] Finished fetching episodes for all series.`);
+        */
+
+        // --- ADD this minimal processing step instead ---
+        seriesList.forEach(series => {
+            series.type = 'series';
+            series.id = series.provider_unique_id; // Use the stable provider_unique_id
+            series.group = series.category_name;
+            // Ensure seasons object is NOT present
+            delete series.seasons;
+        });
+        console.log(`[API_VOD] Processed series headers. Episodes will be lazy-loaded.`);
+        
+        // 5. Respond
+        const categories = await dbAll(db, "SELECT category_name FROM vod_categories ORDER BY category_name");
+        const categoryNames = categories.map(cat => cat.category_name);
+
+        res.json({
+            movies: processedMovies,
+            series: seriesList,
+            categories: categoryNames
+        });
+
+    } catch (error) {
+        console.error(`[API_VOD] Error fetching VOD library from DB: ${error.message}`, error);
+        res.status(500).json({ error: "Could not retrieve VOD library from database." });
+    }
+});
+
+// --- NEW: Lazy Loading Endpoint for Series Details ---
+app.get('/api/vod/series/:seriesId', requireAuth, async (req, res) => {
+    const seriesIdParam = req.params.seriesId;
+
+    console.log(`[API_VOD_SERIES] Request received for Series ID: ${seriesIdParam}`);
+
+    try {
+        // 1. Fetch basic series info using the provider_unique_id
+        const seriesInfo = await dbGet(db, "SELECT * FROM series WHERE provider_unique_id = ?", [seriesIdParam]);
+        if (!seriesInfo) {
+            return res.status(404).json({ error: 'Series not found.' });
+        }
+        const numericSeriesId = seriesInfo.id; // Get the internal numeric ID for relations
+
+        // 2. Check if episodes exist in DB
+        const existingEpisodes = await dbAll(db, `
+            SELECT e.*, r.provider_id, r.provider_stream_id
+            FROM episodes e
+            JOIN provider_episode_relations r ON e.id = r.episode_id
+            WHERE e.series_id = ?
+            ORDER BY e.season_num, e.episode_num
+        `, [numericSeriesId]);
+
+        let episodesToReturn = existingEpisodes;
+
+        // 3. If no episodes in DB, fetch from XC API and save
+        if (existingEpisodes.length === 0) {
+            console.log(`[API_VOD_SERIES] No episodes found in DB for Series ID ${numericSeriesId}. Fetching from provider...`);
+
+            // Find the provider details for this series
+            const relation = await dbGet(db, "SELECT provider_id, external_series_id FROM provider_series_relations WHERE series_id = ? LIMIT 1", [numericSeriesId]);
+            if (!relation) {
+                return res.status(404).json({ error: 'Could not find provider information for this series.' });
+            }
+
+            const settings = getSettings();
+            const providerConfig = settings.m3uSources.find(s => s.id === relation.provider_id);
+            if (!providerConfig || providerConfig.type !== 'xc' || !providerConfig.xc_data) {
+                return res.status(500).json({ error: 'Could not find or parse XC provider configuration for this series.' });
+            }
+
+            let xcInfo;
+            try {
+                xcInfo = JSON.parse(providerConfig.xc_data);
+            } catch (e) {
+                return res.status(500).json({ error: 'Failed to parse XC provider credentials.' });
+            }
+
+            const client = new XtreamClient(xcInfo.server, xcInfo.username, xcInfo.password);
+            let seriesDetails;
+            try {
+                seriesDetails = await client.getSeriesInfo(relation.external_series_id);
+            } catch (xcError) {
+                console.error(`[API_VOD_SERIES] XC Client error for series ${numericSeriesId}: ${xcError.message}`);
+                return res.status(504).json({ error: `Provider timeout: Could not fetch series details from the provider. Please try again later.` });
+            }
+
+            if (!seriesDetails || !seriesDetails.episodes) {
+                console.warn(`[API_VOD_SERIES] Provider returned no episode data for external ID ${relation.external_series_id}.`);
+                episodesToReturn = [];
+            } else {
+                console.log(`[API_VOD_SERIES] Fetched ${Object.values(seriesDetails.episodes).flat().length} episodes from provider. Saving to DB...`);
+                const episodeInsertStmt = db.prepare(`INSERT OR IGNORE INTO episodes (series_id, season_num, episode_num, name, description, air_date, tmdb_id, imdb_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+                const episodeRelationInsertStmt = db.prepare(`INSERT OR IGNORE INTO provider_episode_relations (provider_id, episode_id, provider_stream_id, last_seen) VALUES (?, ?, ?, ?)`);
+                const lastSeen = new Date().toISOString();
+
+                await dbRun(db, "BEGIN TRANSACTION");
+                try {
+                    for (const seasonNum in seriesDetails.episodes) {
+                        for (const epData of seriesDetails.episodes[seasonNum]) {
+                            let episodeId;
+                            const existingEp = await dbGet(db, `SELECT id FROM episodes WHERE series_id = ? AND season_num = ? AND episode_num = ?`, [numericSeriesId, epData.season || seasonNum, epData.episode_num]);
+
+                            if (existingEp) {
+                                episodeId = existingEp.id;
+                            } else {
+                                const epResult = await new Promise((resolve, reject) => {
+                                    episodeInsertStmt.run(numericSeriesId, epData.season || seasonNum, epData.episode_num, epData.title, epData.info?.plot, epData.info?.releasedate, null, null, function (err) {
+                                        if (err) reject(err);
+                                        else resolve(this);
+                                    });
+                                });
+                                episodeId = epResult.lastID;
+                            }
+
+                            await new Promise((resolve, reject) => {
+                                episodeRelationInsertStmt.run(relation.provider_id, episodeId, epData.id, lastSeen, function (err) {
+                                    if (err) reject(err);
+                                    else resolve(this);
+                                });
+                            });
+                        }
+                    }
+                    await dbRun(db, "COMMIT");
+                    console.log(`[API_VOD_SERIES] Successfully saved episodes for Series ID ${numericSeriesId} to DB.`);
+                } catch (dbError) {
+                    await dbRun(db, "ROLLBACK");
+                    console.error(`[API_VOD_SERIES] DB Error saving episodes for Series ID ${numericSeriesId}: ${dbError.message}`);
+                    return res.status(500).json({ error: 'Failed to save fetched episodes to database.' });
+                } finally {
+                    episodeInsertStmt.finalize();
+                    episodeRelationInsertStmt.finalize();
+                }
+                episodesToReturn = await dbAll(db, `
+                    SELECT e.*, r.provider_id, r.provider_stream_id
+                    FROM episodes e
+                    JOIN provider_episode_relations r ON e.id = r.episode_id
+                    WHERE e.series_id = ?
+                    ORDER BY e.season_num, e.episode_num
+                `, [numericSeriesId]);
+            }
+        } else {
+             console.log(`[API_VOD_SERIES] Found ${existingEpisodes.length} episodes in DB for Series ID ${numericSeriesId}.`);
+        }
+
+        // 4. Build the response structure
+        const seasons = new Map();
+        const settings = getSettings();
+        const activeXcProviders = settings.m3uSources.filter(s => s.isActive && s.type === 'xc');
+        const providerMap = new Map();
+        activeXcProviders.forEach(p => {
+            try {
+                const xcInfo = JSON.parse(p.xc_data);
+                const url = new URL(xcInfo.server);
+                providerMap.set(p.id, {
+                    baseUrl: `${url.protocol}//${url.host}`,
+                    username: xcInfo.username,
+                    password: xcInfo.password
+                });
+            } catch (e) { /* ignore */ }
+        });
+
+
+        episodesToReturn.forEach(ep => {
+            const provider = providerMap.get(ep.provider_id);
+            if (!provider) return;
+
+            const ext = 'mp4';
+            const epUrl = `${provider.baseUrl}/series/${provider.username}/${provider.password}/${ep.provider_stream_id}.${ext}`;
+            const seasonNum = ep.season_num;
+
+            if (!seasons.has(seasonNum)) {
+                seasons.set(seasonNum, []);
+            }
+            seasons.get(seasonNum).push({
+                id: String(ep.id),
+                name: ep.name,
+                description: ep.description,
+                air_date: ep.air_date,
+                tmdb_id: ep.tmdb_id,
+                season: ep.season_num,
+                episode: ep.episode_num,
+                url: epUrl
+            });
+        });
+
+        const finalSeriesData = {
+            ...seriesInfo,
+            id: seriesInfo.provider_unique_id, // Use the stable provider_unique_id
+            type: 'series',
+            group: seriesInfo.category_name,
+            seasons: Object.fromEntries(seasons)
+        };
+
+        res.json(finalSeriesData);
+
+    } catch (error) {
+        console.error(`[API_VOD_SERIES] Error fetching details for Series ID ${seriesIdParam}: ${error.message}`, error);
+        res.status(500).json({ error: "Could not retrieve series details." });
+    }
+});
+// --- END NEW ENDPOINT ---
+
+// --- NEW: VOD Categories Endpoint ---
+app.get('/api/vod/categories', requireAuth, async (req, res) => {
+    console.log('[API_VOD] Request received for /api/vod/categories');
+    try {
+        const categories = await dbAll(db, "SELECT category_name FROM vod_categories ORDER BY category_name");
+        const categoryNames = categories.map(cat => cat.category_name);
+        res.json({ success: true, categories: categoryNames });
+    } catch (error) {
+        console.error(`[API_VOD] Error fetching VOD categories: ${error.message}`, error);
+        res.status(500).json({ error: "Could not retrieve VOD categories." });
+    }
+});
 
 const upload = multer({
     storage: multer.diskStorage({
@@ -1135,8 +1921,9 @@ const upload = multer({
 
 
 app.post('/api/sources', requireAuth, upload.single('sourceFile'), async (req, res) => {
-    // FIX: Correctly read all possible fields from the form data, including 'xc'.
-    const { sourceType, name, url, isActive, id, refreshHours, xc } = req.body;
+    // ADD selectedGroups to the destructured body
+    const { sourceType, name, url, isActive, id, refreshHours, xc, selectedGroups } = req.body;
+    
     console.log(`[SOURCES_API] ${id ? 'Updating' : 'Adding'} source. Type: ${sourceType}, Name: ${name}`);
 
     if (!sourceType || !name) {
@@ -1162,6 +1949,15 @@ app.post('/api/sources', requireAuth, upload.single('sourceFile'), async (req, r
         sourceToUpdate.isActive = isActive === 'true';
         sourceToUpdate.refreshHours = parseInt(refreshHours, 10) || 0;
         sourceToUpdate.lastUpdated = new Date().toISOString();
+        
+        // ADDED: Save selectedGroups
+        try {
+            sourceToUpdate.selectedGroups = JSON.parse(selectedGroups || '[]');
+        } catch (e) {
+            console.warn(`[SOURCES_API] Could not parse selectedGroups for source ${id}, saving as empty array.`);
+            sourceToUpdate.selectedGroups = [];
+        }
+
 
         if (req.file) {
             console.log(`[SOURCES_API] New file uploaded for source ${id}. Deleting old file if exists.`);
@@ -1177,7 +1973,6 @@ app.post('/api/sources', requireAuth, upload.single('sourceFile'), async (req, r
                 fs.renameSync(req.file.path, newPath);
                 sourceToUpdate.path = newPath;
                 sourceToUpdate.type = 'file';
-                // FIX: Clear xc_data if switching from XC to File
                 delete sourceToUpdate.xc_data;
                 console.log(`[SOURCES_API] Renamed uploaded file to: ${newPath}`);
             } catch (e) {
@@ -1194,7 +1989,6 @@ app.post('/api/sources', requireAuth, upload.single('sourceFile'), async (req, r
             }
             sourceToUpdate.path = url;
             sourceToUpdate.type = 'url';
-            // FIX: Clear xc_data if switching from XC to URL
             delete sourceToUpdate.xc_data;
         } else if (xc) {
             console.log(`[SOURCES_API] XC credentials provided for source ${id}.`);
@@ -1216,6 +2010,49 @@ app.post('/api/sources', requireAuth, upload.single('sourceFile'), async (req, r
             return res.status(400).json({ error: 'Existing file source requires a new file if original is missing.' });
         }
 
+        // Cache cleanup on source type/path/details change during update ---
+        let shouldDeleteCache = false;
+        const existingCachePath = sourceToUpdate.cachedRawPath; // Store existing path before potential changes
+
+        // Determine the NEW source type based on the logic that just ran above this block
+        let newSourceType = 'unknown';
+        if (req.file) {
+            newSourceType = 'file';
+        } else if (url !== undefined && url !== null) {
+            newSourceType = 'url';
+        } else if (xc) {
+            newSourceType = 'xc';
+        } else {
+            newSourceType = sourceToUpdate.type; // Keep original if no new info provided
+        }
+
+
+        // Condition 1: If it HAD a cache file, but the NEW type is 'file'
+        if (existingCachePath && newSourceType === 'file') {
+            console.log(`[SOURCES_API_CACHE_CLEANUP] Source ${id} changed to 'file' type. Flagging cache for deletion.`);
+            shouldDeleteCache = true;
+        }
+        // Condition 2: If it HAD a cache file, the NEW type is 'url', AND the URL changed
+        else if (existingCachePath && newSourceType === 'url' && sourceToUpdate.path !== url) {
+             console.log(`[SOURCES_API_CACHE_CLEANUP] Source ${id} URL changed. Flagging cache for deletion.`);
+             shouldDeleteCache = true;
+        }
+        // Condition 3: If it HAD a cache file, the NEW type is 'xc', AND the XC details changed
+        else if (existingCachePath && newSourceType === 'xc' && sourceToUpdate.xc_data !== xc) {
+             console.log(`[SOURCES_API_CACHE_CLEANUP] Source ${id} XC details changed. Flagging cache for deletion.`);
+             shouldDeleteCache = true;
+        }
+
+        // Perform deletion if flagged
+        if (shouldDeleteCache && fs.existsSync(existingCachePath)) {
+             try {
+                fs.unlinkSync(existingCachePath);
+                console.log(`[SOURCES_API_CACHE_CLEANUP] Deleted stale cached raw file during update: ${existingCachePath}`);
+             } catch (e) { console.error("[SOURCES_API_CACHE_CLEANUP] Could not delete stale cached raw file during update:", e); }
+             // Remove the path property from the source object being saved
+             delete sourceToUpdate.cachedRawPath;
+        }
+
         saveSettings(settings);
         console.log(`[SOURCES_API] Source ${id} updated successfully.`);
         res.json({ success: true, message: 'Source updated successfully.', settings: getSettings() });
@@ -1223,7 +2060,14 @@ app.post('/api/sources', requireAuth, upload.single('sourceFile'), async (req, r
     } else { // Add new source
         let newSource;
         
-        // FIX: Unified and corrected logic for adding a new source
+        // Parse selectedGroups for new sources
+        let parsedSelectedGroups = [];
+        try {
+            parsedSelectedGroups = JSON.parse(selectedGroups || '[]');
+        } catch (e) {
+            console.warn(`[SOURCES_API] Could not parse selectedGroups for new source, saving as empty array.`);
+        }
+        
         if (xc) { // It's an XC source
              let xcData = {};
              try {
@@ -1242,7 +2086,8 @@ app.post('/api/sources', requireAuth, upload.single('sourceFile'), async (req, r
                  refreshHours: parseInt(refreshHours, 10) || 0,
                  lastUpdated: new Date().toISOString(),
                  status: 'Pending',
-                 statusMessage: 'Source added. Process to load data.'
+                 statusMessage: 'Source added. Process to load data.',
+                 selectedGroups: parsedSelectedGroups // ADDED
              };
         } else { // It's a URL or File source
             newSource = {
@@ -1254,7 +2099,8 @@ app.post('/api/sources', requireAuth, upload.single('sourceFile'), async (req, r
                 refreshHours: parseInt(refreshHours, 10) || 0,
                 lastUpdated: new Date().toISOString(),
                 status: 'Pending',
-                statusMessage: 'Source added. Process to load data.'
+                statusMessage: 'Source added. Process to load data.',
+                selectedGroups: parsedSelectedGroups // ADDED
             };
         }
         
@@ -1315,7 +2161,7 @@ app.put('/api/sources/:sourceType/:id', requireAuth, (req, res) => {
     res.json({ success: true, message: 'Source updated.', settings: getSettings() });
 });
 
-app.delete('/api/sources/:sourceType/:id', requireAuth, (req, res) => {
+app.delete('/api/sources/:sourceType/:id', requireAuth, async (req, res) => {
     const { sourceType, id } = req.params;
     console.log(`[SOURCES_API] Deleting source ID: ${id}, Type: ${sourceType}`);
     
@@ -1331,6 +2177,15 @@ app.delete('/api/sources/:sourceType/:id', requireAuth, (req, res) => {
             console.error(`[SOURCES_API] Could not delete source file: ${source.path}`, e);
         }
     }
+
+    if (source && source.cachedRawPath && fs.existsSync(source.cachedRawPath)) {
+        try {
+            fs.unlinkSync(source.cachedRawPath);
+            console.log(`[SOURCES_API] Deleted cached raw file: ${source.cachedRawPath}`);
+        } catch (e) {
+            console.error(`[SOURCES_API] Could not delete cached raw file: ${source.cachedRawPath}`, e);
+        }
+    }
     
     const initialLength = sourceList.length;
     const newList = sourceList.filter(s => s.id !== id);
@@ -1343,7 +2198,31 @@ app.delete('/api/sources/:sourceType/:id', requireAuth, (req, res) => {
     }
 
     saveSettings(settings);
-    console.log(`[SOURCES_API] Source ${id} deleted successfully.`);
+    console.log(`[SOURCES_API] Source ${id} deleted successfully from settings.`);
+
+    // --- NEW: VOD Database Cleanup ---
+    if (sourceType === 'm3u' && source.type === 'xc') {
+        try {
+            console.log(`[SOURCES_API] Deleting VOD relations for provider: ${id}`);
+            await dbRun(db, "BEGIN TRANSACTION");
+            await dbRun(db, `DELETE FROM provider_movie_relations WHERE provider_id = ?`, [id]);
+            await dbRun(db, `DELETE FROM provider_series_relations WHERE provider_id = ?`, [id]);
+            await dbRun(db, `DELETE FROM provider_episode_relations WHERE provider_id = ?`, [id]);
+            
+            // Cleanup orphans
+            await dbRun(db, `DELETE FROM movies WHERE id NOT IN (SELECT DISTINCT movie_id FROM provider_movie_relations)`);
+            await dbRun(db, `DELETE FROM series WHERE id NOT IN (SELECT DISTINCT series_id FROM provider_series_relations)`);
+            await dbRun(db, `DELETE FROM episodes WHERE id NOT IN (SELECT DISTINCT episode_id FROM provider_episode_relations)`);
+            
+            await dbRun(db, "COMMIT");
+            console.log(`[SOURCES_API] Successfully cleaned up VOD data for provider: ${id}`);
+        } catch (dbErr) {
+            await dbRun(db, "ROLLBACK");
+            console.error(`[SOURCES_API] Error cleaning up VOD data for provider ${id}:`, dbErr.message);
+        }
+    }
+    // --- END NEW ---
+
     res.json({ success: true, message: 'Source deleted.', settings: getSettings() });
 });
 
@@ -1641,7 +2520,7 @@ app.delete('/api/data', requireAuth, requireAdmin, (req, res) => {
         runningFFmpegProcesses.clear();
 
         console.log('[API_RESET] Wiping all data files...');
-        const filesToDelete = [MERGED_M3U_PATH, MERGED_EPG_JSON_PATH, SETTINGS_PATH, VAPID_KEYS_PATH];
+        const filesToDelete = [LIVE_CHANNELS_M3U_PATH, LIVE_EPG_JSON_PATH, VOD_MOVIES_JSON_PATH, VOD_SERIES_JSON_PATH, SETTINGS_PATH, VAPID_KEYS_PATH];
         filesToDelete.forEach(file => {
             if (fs.existsSync(file)) fs.unlinkSync(file);
         });
@@ -1730,7 +2609,7 @@ app.get('/stream', requireAuth, async (req, res) => {
     }
 
     //-- ENHANCEMENT: Find channel name and logo for logging.
-    const allChannels = parseM3U(fs.existsSync(MERGED_M3U_PATH) ? fs.readFileSync(MERGED_M3U_PATH, 'utf-8') : '');
+    const allChannels = parseM3U(fs.existsSync(LIVE_CHANNELS_M3U_PATH) ? fs.readFileSync(LIVE_CHANNELS_M3U_PATH, 'utf-8') : '');
     const channel = allChannels.find(c => c.url === streamUrl);
     const channelName = channel ? channel.displayName || channel.name : 'Direct Stream';
     const channelId = channel ? channel.id : null;
@@ -2361,7 +3240,7 @@ function stopRecording(jobId) {
 async function startRecording(job) {
     console.log(`[DVR] Starting recording for job ${job.id}: "${job.programTitle}"`);
     const settings = getSettings();
-    const allChannels = parseM3U(fs.existsSync(MERGED_M3U_PATH) ? fs.readFileSync(MERGED_M3U_PATH, 'utf-8') : '');
+    const allChannels = parseM3U(fs.existsSync(LIVE_CHANNELS_M3U_PATH) ? fs.readFileSync(LIVE_CHANNELS_M3U_PATH, 'utf-8') : '');
     const channel = allChannels.find(c => c.id === job.channelId);
 
     if (!channel) {

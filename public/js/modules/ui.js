@@ -15,6 +15,7 @@ import { initDirectPlayer, isDirectPlayerActive, cleanupDirectPlayer } from './p
 import { finalizeGuideLoad, handleGuideLoad } from './guide.js';
 import { fetchConfig } from './api.js';
 import { initActivityPage } from './admin.js';
+import { initVodPage } from './vod.js';
 
 
 let confirmCallback = null;
@@ -362,6 +363,7 @@ async function proceedWithRouteChange(path) {
     const isMultiView = path.startsWith('/multiview');
     const isPlayer = path.startsWith('/player');
     const isDvr = path.startsWith('/dvr');
+    const isVod = path.startsWith('/vod');
     const isActivity = path.startsWith('/activity');
     const isNotifications = path.startsWith('/notifications');
     const isSettings = path.startsWith('/settings');
@@ -383,6 +385,11 @@ async function proceedWithRouteChange(path) {
     // DVR tab is visible to all users to see completed recordings
     if (UIElements.tabDvr) UIElements.tabDvr.classList.toggle('active', isDvr);
     if (UIElements.mobileNavDvr) UIElements.mobileNavDvr.classList.toggle('active', isDvr);
+
+    // VOD tab is visible to all
+    if (UIElements.tabVod) UIElements.tabVod.classList.toggle('active', isVod);
+    if (UIElements.mobileNavVod) UIElements.mobileNavVod.classList.toggle('active', isVod);
+    // --- END ADD ---
 
     // Activity tab is for admins only
     if (UIElements.tabActivity) {
@@ -421,6 +428,11 @@ async function proceedWithRouteChange(path) {
     UIElements.pageDvr.classList.toggle('hidden', !isDvr); 
     UIElements.pageDvr.classList.toggle('flex', isDvr);
 
+    // Show VOD page to everyone
+    UIElements.pageVod.classList.toggle('hidden', !isVod);
+    UIElements.pageVod.classList.toggle('flex', isVod);
+    // --- END ADD ---
+
     UIElements.pageActivity.classList.toggle('hidden', !isActivity || !isAdmin);
     UIElements.pageActivity.classList.toggle('flex', isActivity && isAdmin);
     
@@ -443,12 +455,15 @@ async function proceedWithRouteChange(path) {
         }
 
         if (!appState.isNavigating) {
-            console.log('[UI] Refreshing TV Guide data on tab switch.');
-            const config = await fetchConfig();
-            if (config) {
-                Object.assign(guideState.settings, config.settings || {});
-                finalizeGuideLoad(true);
-            }
+                console.log('[UI] Refreshing TV Guide data on tab switch.');
+                const config = await fetchConfig();
+                if (config) {
+                    Object.assign(guideState.settings, config.settings || {});
+                    // --- FIX: Add VOD data to the global state ---
+                    //guideState.vodMovies = config.vodMovies || [];
+                    //guideState.vodSeries = config.vodSeries || [];
+                    finalizeGuideLoad(true);
+                }
         } else {
             console.log('[UI] Skipping soft refresh because a navigation action is in progress.');
         }
@@ -471,6 +486,8 @@ async function proceedWithRouteChange(path) {
             initDirectPlayer();
         } else if (isDvr) { // DVR page init is now called for all users
             await initDvrPage();
+        } else if (isVod) {
+            await initVodPage();
         } else if (isActivity && isAdmin) {
             await initActivityPage();
         }
@@ -500,6 +517,7 @@ export const switchTab = (activeTab) => {
     else if (activeTab === 'multiview') newPath = '/multiview';
     else if (activeTab === 'player') newPath = '/player';
     else if (activeTab === 'dvr') newPath = '/dvr';
+    else if (activeTab === 'vod') newPath = '/vod';
     else if (activeTab === 'activity') newPath = '/activity';
     else if (activeTab === 'notifications') newPath = '/notifications';
     else newPath = '/settings';
@@ -520,8 +538,11 @@ export async function refreshGuideAfterProcessing() {
 
     // 2. Update the global state
     if (config) {
-        Object.assign(guideState.settings, config.settings || {});
-    }
+            Object.assign(guideState.settings, config.settings || {});
+            // --- FIX: Add VOD data to the global state ---
+            //guideState.vodMovies = config.vodMovies || [];
+            //guideState.vodSeries = config.vodSeries || [];
+        }
 
     // 3. Close the modal
     closeModal(UIElements.processingStatusModal);

@@ -403,10 +403,47 @@ const openSourceEditor = (sourceType, source = null) => {
     UIElements.sourceEditorUrlContainer.classList.toggle('hidden', activeTab !== 'url');
     UIElements.sourceEditorFileContainer.classList.toggle('hidden', activeTab !== 'file');
     UIElements.sourceEditorXcContainer.classList.toggle('hidden', activeTab !== 'xc');
+
+    // --- NEW: Add "Filter Groups" button and hidden input ---
+    const filterGroupBtnHTML = `
+        <div id="source-editor-filter-groups-container" class="mt-4 ${activeTab === 'file' ? 'hidden' : ''}">
+            <label class="block text-sm font-medium text-gray-400">Group Filtering</label>
+            <p class="text-xs text-gray-500 mb-2">Select which groups to import. If none are selected, all groups will be imported.</p>
+            <div class="flex gap-2">
+                <button type="button" id="source-editor-filter-groups-btn" class="flex-grow bg-gray-600 hover:bg-gray-500 text-white font-bold py-2 px-4 rounded-md">
+                    <span>Select Groups</span>
+                </button>
+                <button type="button" id="source-editor-refresh-groups-btn" class="flex-shrink-0 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-2 rounded-md" title="Refresh groups from source">
+                     ${ICONS.refresh}
+                </button>
+            </div>
+            <input type="hidden" id="source-editor-selected-groups" value="[]">
+        </div>
+    `;
+    // Remove old button if it exists, then add the new one
+    const oldBtnContainer = document.getElementById('source-editor-filter-groups-container');
+    if (oldBtnContainer) {
+        oldBtnContainer.remove();
+    }
+    UIElements.sourceEditorRefreshContainer.insertAdjacentHTML('beforebegin', filterGroupBtnHTML);
+
+    // Populate hidden input with existing selected groups if editing
+    if (source && source.selectedGroups) {
+        document.getElementById('source-editor-selected-groups').value = JSON.stringify(source.selectedGroups);
+        const count = source.selectedGroups.length;
+        // MODIFIED: Target the inner span now
+        const btnSpan = document.querySelector('#source-editor-filter-groups-btn span');
+        if (btnSpan) {
+            btnSpan.textContent = count > 0 ? `${count} Groups Selected` : 'Select Groups';
+        }
+    }
     
     // Hide refresh interval for file-based sources
     UIElements.sourceEditorRefreshContainer.classList.toggle('hidden', activeTab === 'file');
     UIElements.sourceEditorFileInfo.classList.add('hidden'); // Hide file info by default
+    document.getElementById('source-editor-filter-groups-container').classList.toggle('hidden', activeTab === 'file');
+
+    
 
     // Populate the form fields based on the source data
     if (source) {
@@ -520,13 +557,13 @@ export function setupSettingsEventListeners() {
                     openModal(UIElements.processingStatusModal);
                     return;
                 }
-    
+
                 // 1. Open the processing modal (this sets isProcessingRunning = true)
                 showProcessingModal();
-        
+
                 // 2. Trigger the backend process.
                 const res = await apiFetch('/api/process-sources', { method: 'POST' });
-        
+
                 // 3. Handle initial request failure
                 if (!res || !res.ok) {
                     const data = res ? await res.json() : { error: 'Could not connect to server.'};
@@ -534,44 +571,54 @@ export function setupSettingsEventListeners() {
                 }
             });
         }
-    
+
     UIElements.addM3uBtn.addEventListener('click', () => openSourceEditor('m3u'));
     UIElements.addEpgBtn.addEventListener('click', () => openSourceEditor('epg'));
     UIElements.sourceEditorCancelBtn.addEventListener('click', () => closeModal(UIElements.sourceEditorModal));
 
-    // --- Source Editor ---
+    // --- Source Editor Tabs ---
     const switchSourceEditorTab = (tabType) => {
         currentSourceTypeForEditor = tabType;
         const isUrl = tabType === 'url';
         const isFile = tabType === 'file';
         const isXc = tabType === 'xc';
-    
+
         UIElements.sourceEditorTypeBtnUrl.classList.toggle('bg-blue-600', isUrl);
         UIElements.sourceEditorTypeBtnFile.classList.toggle('bg-blue-600', isFile);
         UIElements.sourceEditorTypeBtnXc.classList.toggle('bg-blue-600', isXc);
-    
+
         UIElements.sourceEditorUrlContainer.classList.toggle('hidden', !isUrl);
         UIElements.sourceEditorFileContainer.classList.toggle('hidden', !isFile);
         UIElements.sourceEditorXcContainer.classList.toggle('hidden', !isXc);
-    
+
         // Refresh interval is shown for URL and XC, but not for File
         UIElements.sourceEditorRefreshContainer.classList.toggle('hidden', isFile);
+        // Also toggle visibility of the group filter button container based on file type
+        const filterGroupsContainer = document.getElementById('source-editor-filter-groups-container');
+        if (filterGroupsContainer) {
+            filterGroupsContainer.classList.toggle('hidden', isFile);
+            const refreshBtn = filterGroupsContainer.querySelector('#source-editor-refresh-groups-btn');
+             if (refreshBtn) {
+                 refreshBtn.classList.toggle('hidden', isFile);
+             }
+        }
     };
 
     UIElements.sourceEditorTypeBtnUrl.addEventListener('click', () => switchSourceEditorTab('url'));
     UIElements.sourceEditorTypeBtnFile.addEventListener('click', () => switchSourceEditorTab('file'));
     UIElements.sourceEditorTypeBtnXc.addEventListener('click', () => switchSourceEditorTab('xc'));
 
+    // --- Source Editor Form Submission ---
     UIElements.sourceEditorForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const id = UIElements.sourceEditorId.value;
         const sourceType = UIElements.sourceEditorType.value;
-        
+
         const formData = new FormData();
         formData.append('sourceType', sourceType);
         formData.append('name', UIElements.sourceEditorName.value);
         formData.append('isActive', UIElements.sourceEditorIsActive.checked);
-        
+
         if (currentSourceTypeForEditor === 'url') {
             formData.append('url', UIElements.sourceEditorUrl.value);
             formData.append('refreshHours', UIElements.sourceEditorRefreshInterval.value);
@@ -590,7 +637,12 @@ export function setupSettingsEventListeners() {
             }));
             formData.append('refreshHours', UIElements.sourceEditorRefreshInterval.value);
         }
-        
+
+        const selectedGroupsInput = document.getElementById('source-editor-selected-groups');
+        if (selectedGroupsInput) {
+            formData.append('selectedGroups', selectedGroupsInput.value || '[]');
+        }
+
         if (id) formData.append('id', id);
 
         const res = await apiFetch('/api/sources', { method: 'POST', body: formData });
@@ -606,22 +658,22 @@ export function setupSettingsEventListeners() {
              showNotification(`Error: ${data.error}`, true);
         }
     });
-    
-    // NEW: URL Validation
+
+    // --- Source Editor URL Test Button ---
     UIElements.testSourceUrlBtn.addEventListener('click', async () => {
         const url = UIElements.sourceEditorUrl.value.trim();
         if (!url) {
             return showNotification('Please enter a URL to test.', true);
         }
-        const originalContent = UIElements.testSourceUrlBtn.innerHTML;
-        setButtonLoadingState(UIElements.testSourceUrlBtn, true, 'Testing...');
-        
+        const originalContent = UIElements.testSourceUrlBtn.innerHTML; // Note: using innerHTML for spinner
+        setButtonLoadingState(UIElements.testSourceUrlBtn, true, 'Testing...'); // Pass original innerHTML
+
         const res = await apiFetch('/api/validate-url', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url })
         });
-        
+
         if (res && res.ok) {
             const data = await res.json();
             if (data.success) {
@@ -629,11 +681,10 @@ export function setupSettingsEventListeners() {
             }
         }
         // apiFetch handles error notifications automatically
-        
-        setButtonLoadingState(UIElements.testSourceUrlBtn, false, originalContent);
+        setButtonLoadingState(UIElements.testSourceUrlBtn, false, originalContent); // Restore original innerHTML
     });
 
-    // --- Source Table Clicks ---
+    // --- Source Table Clicks (Edit, Delete, Activate) ---
     const handleSourceTableClick = async (e, sourceType) => {
         const target = e.target;
         const row = target.closest('tr');
@@ -647,20 +698,20 @@ export function setupSettingsEventListeners() {
         } else if (target.closest('.delete-source-btn')) {
             showConfirm('Delete Source?', 'This will delete the source configuration. The downloaded file (if any) will also be removed.', async () => {
                 const res = await apiFetch(`/api/sources/${sourceType}/${sourceId}`, { method: 'DELETE' });
-                if(res?.ok) { 
+                if(res?.ok) {
                     const data = await res.json();
                     Object.assign(guideState.settings, data.settings); // Merge settings
                     updateUIFromSettings();
-                    showNotification('Source deleted.'); 
-                } 
-                else if (res) { const data = await res.json(); showNotification(`Error: ${data.error}`, true); }
+                    showNotification('Source deleted.');
+                }
+                // Error handled by apiFetch
             });
         } else if (target.classList.contains('activate-switch')) {
             const isActive = target.checked;
             const res = await apiFetch(`/api/sources/${sourceType}/${sourceId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...source, isActive })
+                body: JSON.stringify({ ...source, isActive }) // Send full source object for potential future use
             });
             if (res?.ok) {
                 const data = await res.json();
@@ -675,24 +726,24 @@ export function setupSettingsEventListeners() {
     UIElements.m3uSourcesTbody.addEventListener('click', (e) => handleSourceTableClick(e, 'm3u'));
     UIElements.epgSourcesTbody.addEventListener('click', (e) => handleSourceTableClick(e, 'epg'));
 
-    // --- General Settings ---
+    // --- General Settings Inputs ---
     UIElements.timezoneOffsetSelect.addEventListener('change', (e) => saveSettingAndNotify(saveGlobalSetting, { timezoneOffset: parseInt(e.target.value, 10) }));
     UIElements.searchScopeSelect.addEventListener('change', (e) => saveSettingAndNotify(saveGlobalSetting, { searchScope: e.target.value }));
     UIElements.notificationLeadTimeInput.addEventListener('change', async (e) => {
         const value = parseInt(e.target.value, 10);
         if (isNaN(value) || value < 1) {
             showNotification('Notification lead time must be a positive number.', true);
-            e.target.value = guideState.settings.notificationLeadTime; // Revert to current setting
+            e.target.value = guideState.settings.notificationLeadTime; // Revert
             return;
         }
         await saveSettingAndNotify(saveGlobalSetting, { notificationLeadTime: value });
     });
-    
-    // --- MODIFIED: Event listeners for hardware info modal ---
+
+    // --- Hardware Info Modal ---
     UIElements.hardwareInfoBtn.addEventListener('click', () => openModal(UIElements.hardwareInfoModal));
     UIElements.hardwareInfoModalCloseBtn.addEventListener('click', () => closeModal(UIElements.hardwareInfoModal));
 
-    // --- DVR Settings ---
+    // --- DVR Settings Inputs ---
     const handleDvrSettingChange = (key, value) => {
         const newDvrSettings = { ...guideState.settings.dvr, [key]: value };
         saveSettingAndNotify(saveGlobalSetting, { dvr: newDvrSettings });
@@ -712,7 +763,7 @@ export function setupSettingsEventListeners() {
     }
     UIElements.dvrRecordingProfileSelect.addEventListener('change', (e) => handleDvrSettingChange('activeRecordingProfileId', e.target.value));
 
-    // --- Player Settings (User Agents & Stream Profiles) ---
+    // --- Player Settings (User Agents & Stream Profiles) Buttons ---
     UIElements.addUserAgentBtn.addEventListener('click', () => openEditorModal('userAgent'));
     UIElements.editUserAgentBtn.addEventListener('click', () => {
         const agent = guideState.settings.userAgents.find(ua => ua.id === UIElements.userAgentSelect.value);
@@ -720,9 +771,14 @@ export function setupSettingsEventListeners() {
     });
     UIElements.deleteUserAgentBtn.addEventListener('click', () => {
         const selectedId = UIElements.userAgentSelect.value;
+        const agentToDelete = guideState.settings.userAgents.find(ua => ua.id === selectedId);
+        if (!agentToDelete || agentToDelete.isDefault) {
+             showNotification("Cannot delete the default User Agent.", true);
+             return;
+        }
         showConfirm('Delete User Agent?', 'Are you sure?', async () => {
             const updatedList = guideState.settings.userAgents.filter(ua => ua.id !== selectedId);
-            const newActiveId = (guideState.settings.activeUserAgentId === selectedId) ? (updatedList[0]?.id || null) : guideState.settings.activeUserAgentId;
+            const newActiveId = (guideState.settings.activeUserAgentId === selectedId) ? (guideState.settings.userAgents.find(ua => ua.isDefault)?.id || updatedList[0]?.id || null) : guideState.settings.activeUserAgentId;
             const settings = await saveGlobalSetting({ userAgents: updatedList, activeUserAgentId: newActiveId });
             if (settings) {
                 guideState.settings = settings;
@@ -738,21 +794,28 @@ export function setupSettingsEventListeners() {
     });
     UIElements.deleteStreamProfileBtn.addEventListener('click', () => {
         const selectedId = UIElements.streamProfileSelect.value;
+        const profileToDelete = guideState.settings.streamProfiles.find(p => p.id === selectedId);
+         if (!profileToDelete || profileToDelete.isDefault) {
+             showNotification("Cannot delete a default Stream Profile.", true);
+             return;
+         }
         showConfirm('Delete Stream Profile?', 'Are you sure?', async () => {
             const updatedList = guideState.settings.streamProfiles.filter(p => p.id !== selectedId);
-            const newActiveId = (guideState.settings.activeStreamProfileId === selectedId) ? (updatedList[0]?.id || null) : guideState.settings.activeStreamProfileId;
+            const newActiveId = (guideState.settings.activeStreamProfileId === selectedId) ? (guideState.settings.streamProfiles.find(p => p.isDefault)?.id || updatedList[0]?.id || null) : guideState.settings.activeStreamProfileId;
             const settings = await saveGlobalSetting({ streamProfiles: updatedList, activeStreamProfileId: newActiveId });
             if (settings) {
                 guideState.settings = settings;
                 updateUIFromSettings();
-                showNotification('Stream Profile saved.');
+                showNotification('Stream Profile deleted.'); // Corrected notification
             }
         });
     });
+
+    // --- Player Settings Dropdown Changes ---
     UIElements.userAgentSelect.addEventListener('change', (e) => saveSettingAndNotify(saveGlobalSetting, { activeUserAgentId: e.target.value }));
     UIElements.streamProfileSelect.addEventListener('change', (e) => saveSettingAndNotify(saveGlobalSetting, { activeStreamProfileId: e.target.value }));
 
-    // --- Recording Profiles ---
+    // --- Recording Profiles Buttons ---
     UIElements.addDvrProfileBtn.addEventListener('click', () => openEditorModal('recordingProfile'));
     UIElements.editDvrProfileBtn.addEventListener('click', () => {
         const profile = (guideState.settings.dvr?.recordingProfiles || []).find(p => p.id === UIElements.dvrRecordingProfileSelect.value);
@@ -760,9 +823,14 @@ export function setupSettingsEventListeners() {
     });
     UIElements.deleteDvrProfileBtn.addEventListener('click', () => {
         const selectedId = UIElements.dvrRecordingProfileSelect.value;
+        const profileToDelete = (guideState.settings.dvr?.recordingProfiles || []).find(p => p.id === selectedId);
+        if (!profileToDelete || profileToDelete.isDefault) {
+             showNotification("Cannot delete a default Recording Profile.", true);
+             return;
+        }
         showConfirm('Delete Recording Profile?', 'Are you sure?', async () => {
             const updatedList = (guideState.settings.dvr?.recordingProfiles || []).filter(p => p.id !== selectedId);
-            const newActiveId = (guideState.settings.dvr?.activeRecordingProfileId === selectedId) ? (updatedList[0]?.id || null) : guideState.settings.dvr?.activeRecordingProfileId;
+            const newActiveId = (guideState.settings.dvr?.activeRecordingProfileId === selectedId) ? ((guideState.settings.dvr?.recordingProfiles || []).find(p => p.isDefault)?.id || updatedList[0]?.id || null) : guideState.settings.dvr?.activeRecordingProfileId;
             const settingsToSave = {
                 dvr: {
                     ...guideState.settings.dvr,
@@ -778,41 +846,60 @@ export function setupSettingsEventListeners() {
             }
         });
     });
-    
-    // --- Editor Modal ---
+
+    // --- Editor Modal (User Agent/Stream Profile/Recording Profile) ---
     UIElements.editorCancelBtn.addEventListener('click', () => closeModal(UIElements.editorModal));
     UIElements.editorForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const id = UIElements.editorId.value, type = UIElements.editorType.value, name = UIElements.editorName.value.trim(), value = UIElements.editorValue.value.trim();
         if (!name || !value) return showNotification('Name and value cannot be empty.', true);
-        
+
         let settingsToSave = {};
         const newItem = { id, name, isDefault: false };
+        let listKey, valueKey, activeIdKey;
 
         if (type === 'userAgent') {
-            newItem.value = value;
-            const list = [...(guideState.settings.userAgents || [])];
-            const existingIndex = list.findIndex(item => item.id === id);
-            if (existingIndex > -1) list[existingIndex] = { ...list[existingIndex], ...newItem };
-            else list.push(newItem);
-            settingsToSave.userAgents = list;
+             listKey = 'userAgents';
+             valueKey = 'value';
+             activeIdKey = 'activeUserAgentId';
         } else if (type === 'streamProfile') {
-            newItem.command = value;
-            const list = [...(guideState.settings.streamProfiles || [])];
-            const existingIndex = list.findIndex(item => item.id === id);
-            if (existingIndex > -1) list[existingIndex] = { ...list[existingIndex], ...newItem };
-            else list.push(newItem);
-            settingsToSave.streamProfiles = list;
+            listKey = 'streamProfiles';
+            valueKey = 'command';
+            activeIdKey = 'activeStreamProfileId';
         } else if (type === 'recordingProfile') {
-            newItem.command = value;
-            const list = [...(guideState.settings.dvr?.recordingProfiles || [])];
-            const existingIndex = list.findIndex(item => item.id === id);
-            if (existingIndex > -1) list[existingIndex] = { ...list[existingIndex], ...newItem };
-            else list.push(newItem);
-            settingsToSave.dvr = { ...guideState.settings.dvr, recordingProfiles: list };
+             listKey = 'recordingProfiles'; // Will be nested under 'dvr'
+             valueKey = 'command';
+             activeIdKey = 'activeRecordingProfileId'; // Will be nested under 'dvr'
         } else {
-            return;
+            return showNotification('Invalid editor type.', true);
         }
+
+        newItem[valueKey] = value;
+
+        if (type === 'recordingProfile') {
+            const list = [...(guideState.settings.dvr?.[listKey] || [])];
+            const existingIndex = list.findIndex(item => item.id === id);
+             if (existingIndex > -1) {
+                 // Cannot edit default items' core properties
+                 if (list[existingIndex].isDefault) return showNotification('Cannot edit default profiles.', true);
+                 list[existingIndex] = { ...list[existingIndex], ...newItem };
+             } else {
+                 list.push(newItem);
+             }
+             settingsToSave.dvr = { ...guideState.settings.dvr, [listKey]: list };
+        } else {
+             const list = [...(guideState.settings[listKey] || [])];
+             const existingIndex = list.findIndex(item => item.id === id);
+             if (existingIndex > -1) {
+                  // Cannot edit default items' core properties
+                  if (list[existingIndex].isDefault) return showNotification('Cannot edit default items.', true);
+                  list[existingIndex] = { ...list[existingIndex], ...newItem };
+             } else {
+                 list.push(newItem);
+             }
+             settingsToSave[listKey] = list;
+        }
+
 
         const settings = await saveGlobalSetting(settingsToSave);
         if (settings) {
@@ -822,47 +909,69 @@ export function setupSettingsEventListeners() {
             showNotification(`${type.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase())} saved.`);
         }
     });
-    
+
     // --- User Management ---
     UIElements.addUserBtn.addEventListener('click', () => openUserEditor());
     UIElements.userEditorCancelBtn.addEventListener('click', () => closeModal(UIElements.userEditorModal));
     UIElements.userEditorForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const id = UIElements.userEditorId.value;
-        const body = { 
-            username: UIElements.userEditorUsername.value, 
-            password: UIElements.userEditorPassword.value, 
+        const body = {
+            username: UIElements.userEditorUsername.value,
+            password: UIElements.userEditorPassword.value,
             isAdmin: UIElements.userEditorIsAdmin.checked,
             canUseDvr: UIElements.userEditorCanUseDvr.checked
         };
-        if (!body.password) delete body.password;
+        if (!body.password) delete body.password; // Don't send empty password if not changing
 
-        const res = await apiFetch(id ? `/api/users/${id}` : '/api/users', { method: id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-        if (!res) return;
-        const data = await res.json();
-        if (res.ok) { closeModal(UIElements.userEditorModal); refreshUserList(); }
-        else { UIElements.userEditorError.textContent = data.error; UIElements.userEditorError.classList.remove('hidden'); }
+        const url = id ? `/api/users/${id}` : '/api/users';
+        const method = id ? 'PUT' : 'POST';
+
+        const res = await apiFetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        // apiFetch handles errors, but we need the success case
+        if (res && res.ok) {
+            closeModal(UIElements.userEditorModal);
+            refreshUserList(); // Refresh the list on success
+            showNotification(`User ${id ? 'updated' : 'added'} successfully.`);
+        } else if (res) {
+            // Display specific error from backend if available
+            const data = await res.json().catch(() => ({ error: 'An unknown error occurred.' }));
+            UIElements.userEditorError.textContent = data.error;
+            UIElements.userEditorError.classList.remove('hidden');
+        }
     });
+    // User List Click Handler (Edit/Delete)
     UIElements.userList.addEventListener('click', async (e) => {
         const target = e.target;
-        if (target.disabled) return;
+        if (target.disabled) return; // Ignore clicks on disabled buttons (like delete self)
         const row = target.closest('tr');
         if (!row) return;
         const userId = row.dataset.userId;
 
         if (target.classList.contains('edit-user-btn')) {
-            const res = await apiFetch('/api/users');
-            if (!res) return;
-            const users = await res.json();
-            const user = users.find(u => u.id == userId);
-            if(user) openUserEditor(user);
+            // Fetch the specific user's details again before opening the editor
+            // This ensures we have the latest data, though refreshUserList usually covers it.
+            // For simplicity, we can rely on the data used to render the table if refreshUserList is called often.
+            // Let's assume refreshUserList keeps the UI consistent for now.
+             const res = await apiFetch('/api/users'); // Re-fetch all users to find the one clicked
+             if (!res) return;
+             const users = await res.json();
+             const user = users.find(u => u.id == userId); // Use == for potential type difference
+             if(user) {
+                 openUserEditor(user);
+             } else {
+                 showNotification('Could not find user data to edit.', true);
+             }
         }
-        
+
         if (target.classList.contains('delete-user-btn')) {
-            showConfirm('Delete User?', 'Are you sure?', async () => {
+             showConfirm('Delete User?', 'Are you sure? This action cannot be undone.', async () => {
                  const res = await apiFetch(`/api/users/${userId}`, { method: 'DELETE' });
-                if(res?.ok) { refreshUserList(); showNotification('User deleted.'); } 
-                else if (res) { const data = await res.json(); showNotification(`Error: ${data.error}`, true); }
+                if(res?.ok) { // Check for ok status explicitly
+                    refreshUserList();
+                    showNotification('User deleted.');
+                }
+                // apiFetch handles error notification
             });
         }
     });
@@ -870,25 +979,38 @@ export function setupSettingsEventListeners() {
     // --- Danger Zone ---
     UIElements.clearDataBtn.addEventListener('click', () => {
         showConfirm('Clear All Data?', 'This will permanently delete ALL settings and files from the server and your browser cache. The page will reload.', async () => {
-            await apiFetch('/api/data', { method: 'DELETE' });
-            if (appState.db) {
-                await new Promise((resolve, reject) => {
-                    const req = appState.db.transaction(['guideData'], 'readwrite').objectStore('guideData').clear();
-                    req.onsuccess = resolve;
-                    req.onerror = reject;
-                });
+            const res = await apiFetch('/api/data', { method: 'DELETE' }); // Use apiFetch
+            if(res?.ok) { // Check for ok status
+                if (appState.db) {
+                    try {
+                        await new Promise((resolve, reject) => {
+                             const transaction = appState.db.transaction(['guideData'], 'readwrite');
+                             const store = transaction.objectStore('guideData');
+                             const req = store.clear();
+                             req.onsuccess = resolve;
+                             req.onerror = (event) => reject(event.target.error);
+                        });
+                        console.log('[SETTINGS] IndexedDB cleared successfully.');
+                    } catch (dbError) {
+                        console.error('[SETTINGS] Failed to clear IndexedDB:', dbError);
+                        showNotification('Server data cleared, but failed to clear browser cache. Manual clearing might be needed.', true);
+                    }
+                }
+                showNotification('All data cleared. Reloading...');
+                setTimeout(() => window.location.reload(), 1500);
             }
-            showNotification('All data cleared. Reloading...');
-            setTimeout(() => window.location.reload(), 1500);
+            // apiFetch handles error notification
         });
     });
-    
-    // NEW: Backup & Restore Event Listeners
+
+    // --- Backup & Restore ---
     UIElements.exportSettingsBtn.addEventListener('click', () => {
+        // Trigger download via direct link
         window.location.href = '/api/settings/export';
     });
 
     UIElements.importSettingsBtn.addEventListener('click', () => {
+        // Trigger the hidden file input
         UIElements.importSettingsFileInput.click();
     });
 
@@ -896,13 +1018,14 @@ export function setupSettingsEventListeners() {
         const file = e.target.files[0];
         if (!file) return;
 
-        showConfirm('Import Settings?', 'This will overwrite all current application settings. Are you sure you want to proceed?', async () => {
+        showConfirm('Import Settings?', 'This will overwrite ALL current application settings. Are you sure you want to proceed?', async () => {
             const formData = new FormData();
             formData.append('settingsFile', file);
-            
+
             const res = await apiFetch('/api/settings/import', {
                 method: 'POST',
                 body: formData
+                // Content-Type is set automatically by browser for FormData
             });
 
             if (res && res.ok) {
@@ -911,9 +1034,335 @@ export function setupSettingsEventListeners() {
             }
             // apiFetch handles error notification
         });
-        
+
         // Reset the file input so the 'change' event fires again if the same file is selected
         e.target.value = '';
     });
-}
+
+    // --- Group Filter Modal Interaction Logic (Inside Settings Listeners) ---
+    let tempSelectedGroups = new Set(); // Stores group names temporarily while modal is open
+
+    
+    // Helper function (ensure this is accessible, maybe defined outside setupSettingsEventListeners)
+    const populateGroupFilterModal = (allGroups, selectedGroups) => {
+        tempSelectedGroups.clear(); // Clear previous temporary selections
+        selectedGroups.forEach(group => tempSelectedGroups.add(group)); // Initialize with current selections
+        const groups = { live: [], movie: [], series: [] };
+        const lowerCaseSelected = new Set(selectedGroups.map(g => g.toLowerCase()));
+
+        // Categorize groups
+        allGroups.forEach(group => {
+            const gLower = group.toLowerCase();
+            if (gLower.includes('movie') || gLower.includes('film') || gLower.includes('vod')) {
+                groups.movie.push(group);
+            } else if (gLower.includes('series') || gLower.includes('show') || gLower.includes('tv')) {
+                groups.series.push(group);
+            } else {
+                groups.live.push(group);
+            }
+        });
+
+        // Store categorized groups on the modal element
+        UIElements.groupFilterModal.dataset.groups = JSON.stringify(groups);
+
+        // Set counts on tabs
+        UIElements.groupFilterTabLive.textContent = `Live (${groups.live.length})`;
+        UIElements.groupFilterTabMovies.textContent = `VOD - Movies (${groups.movie.length})`;
+        UIElements.groupFilterTabSeries.textContent = `VOD - Series (${groups.series.length})`;
+
+        // Trigger rendering for the default "live" tab, passing the original case selected groups
+        updateGroupFilterList('live', Array.from(tempSelectedGroups)); // Use temp set
+        // Ensure the 'live' tab is visually active
+        UIElements.groupFilterTabLive.classList.add('active');
+        UIElements.groupFilterTabMovies.classList.remove('active');
+        UIElements.groupFilterTabSeries.classList.remove('active');
+        // Clear search
+        UIElements.groupFilterSearch.value = '';
+    };
+
+    // Helper function (ensure this is accessible)
+    const updateGroupFilterList = (type, selectedGroups, searchTerm = '') => {
+        const listEl = UIElements.groupFilterList;
+        const allCategorizedGroups = JSON.parse(UIElements.groupFilterModal.dataset.groups || '{}');
+        const groupsForType = allCategorizedGroups[type] || [];
+        const lowerCaseSearch = searchTerm.toLowerCase();
+        // Keep track of originally selected groups case-insensitively for checking
+        const lowerCaseSelected = new Set(selectedGroups.map(g => g.toLowerCase()));
+        const filteredGroups = groupsForType.filter(g => g.toLowerCase().includes(lowerCaseSearch));
+        const currentSelectedSet = new Set(selectedGroups);
+
+        if (filteredGroups.length === 0) {
+            listEl.innerHTML = `<p class="text-gray-500 col-span-full text-center">No groups found for this type${searchTerm ? ' matching "' + searchTerm + '"' : ''}.</p>`;
+            return;
+        }
+
+        listEl.innerHTML = filteredGroups.map(group => `
+            <div class="group-filter-item ${currentSelectedSet.has(group) ? 'selected' : ''}" data-group-name="${group.replace(/"/g, '&quot;')}">
+                ${group}
+            </div>
+        `).join('');
+    };
+
+    // Listeners FOR the Group Filter Modal itself
+    UIElements.groupFilterModal.addEventListener('click', (e) => {
+        const item = e.target.closest('.group-filter-item');
+        if (item) {
+            item.classList.toggle('selected');
+        }
+    });
+
+    const switchGroupFilterTab = (type) => {
+
+        // Update tempSelectedGroups based on the currently displayed tab BEFORE switching
+        const currentListItems = UIElements.groupFilterList.querySelectorAll('.group-filter-item');
+        currentListItems.forEach(item => {
+            const groupName = item.dataset.groupName;
+            if (item.classList.contains('selected')) {
+                tempSelectedGroups.add(groupName);
+            } else {
+                tempSelectedGroups.delete(groupName); // Ensure deselected items are removed
+            }
+        });
+        UIElements.groupFilterTabLive.classList.toggle('active', type === 'live');
+        UIElements.groupFilterTabMovies.classList.toggle('active', type === 'movie');
+        UIElements.groupFilterTabSeries.classList.toggle('active', type === 'series');
+        // Get currently selected groups *using their data attribute*
+        const selectedGroups = Array.from(UIElements.groupFilterList.querySelectorAll('.group-filter-item.selected')).map(el => el.dataset.groupName);
+        updateGroupFilterList(type, Array.from(tempSelectedGroups), UIElements.groupFilterSearch.value);
+    };
+    UIElements.groupFilterTabLive.addEventListener('click', () => switchGroupFilterTab('live'));
+    UIElements.groupFilterTabMovies.addEventListener('click', () => switchGroupFilterTab('movie'));
+    UIElements.groupFilterTabSeries.addEventListener('click', () => switchGroupFilterTab('series'));
+
+    UIElements.groupFilterSearch.addEventListener('input', () => {
+        const activeTab = document.querySelector('.group-filter-tab-btn.active').dataset.type;
+        const selectedGroups = Array.from(UIElements.groupFilterList.querySelectorAll('.group-filter-item.selected')).map(el => el.dataset.groupName);
+        updateGroupFilterList(activeTab, selectedGroups, UIElements.groupFilterSearch.value);
+    });
+
+    UIElements.groupFilterSelectAll.addEventListener('click', () => {
+        UIElements.groupFilterList.querySelectorAll('.group-filter-item').forEach(el => el.classList.add('selected'));
+    });
+    UIElements.groupFilterDeselectAll.addEventListener('click', () => {
+        UIElements.groupFilterList.querySelectorAll('.group-filter-item').forEach(el => el.classList.remove('selected'));
+    });
+
+    UIElements.groupFilterCancelBtn.addEventListener('click', () => closeModal(UIElements.groupFilterModal));
+    UIElements.groupFilterCloseBtn.addEventListener('click', () => closeModal(UIElements.groupFilterModal));
+
+UIElements.groupFilterSaveBtn.addEventListener('click', () => {
+        // --- START MODIFICATION ---
+        // Update tempSelectedGroups one last time from the currently visible tab
+        // This ensures selections made just before clicking save are captured.
+        const currentListItems = UIElements.groupFilterList.querySelectorAll('.group-filter-item');
+        currentListItems.forEach(item => {
+            const groupName = item.dataset.groupName;
+            if (item.classList.contains('selected')) {
+                tempSelectedGroups.add(groupName); // Add if selected
+            } else {
+                tempSelectedGroups.delete(groupName); // Remove if not selected on the CURRENT tab
+            }
+        });
+
+        // Use the complete temporary set for saving
+        const finalSelectedGroups = Array.from(tempSelectedGroups);
+        // --- END MODIFICATION ---
+
+        // Get the hidden input field in the source editor modal
+        const hiddenInput = document.getElementById('source-editor-selected-groups');
+        if (hiddenInput) {
+             // --- MODIFIED: Save finalSelectedGroups (the complete set from all tabs) ---
+             hiddenInput.value = JSON.stringify(finalSelectedGroups);
+             // --- END MODIFICATION ---
+             console.log('[SETTINGS] Saving selected groups:', finalSelectedGroups);
+        } else {
+            console.error('[SETTINGS] Could not find hidden input #source-editor-selected-groups to save selections.');
+        }
+
+        // Update the text on the "Select Groups" button in the source editor
+        const filterButton = document.getElementById('source-editor-filter-groups-btn');
+        const btnSpan = filterButton ? filterButton.querySelector('span') : null; // Target the inner span
+        if (btnSpan) {
+            // --- MODIFIED: Use finalSelectedGroups.length ---
+            const count = finalSelectedGroups.length;
+            const btnText = count > 0 ? `${count} Groups Selected` : 'Select Groups';
+            // --- END MODIFICATION ---
+            btnSpan.textContent = btnText; // Update the span's text
+            console.log(`[SETTINGS] Updated filter button text to: "${btnText}"`);
+        } else {
+             console.error('[SETTINGS] Could not find span within #source-editor-filter-groups-btn to update text.');
+        }
+
+        // Close the group filter modal
+        closeModal(UIElements.groupFilterModal);
+    });
+
+
+    // --- CORRECTED: Group Filter Button Listener (Attached on Modal Open) ---
+    // Store the original function if it exists (assuming openSourceEditor is defined globally or imported)
+    const originalOpenSourceEditor = typeof openSourceEditor !== 'undefined' ? openSourceEditor : null;
+
+    // Redefine openSourceEditor to add our listener logic.
+    // NOTE: This assumes openSourceEditor is defined in the same scope or imported.
+    // If it's defined INSIDE setupSettingsEventListeners, this wrapping won't work easily.
+    // For now, let's assume it's defined outside or imported.
+    // If this causes issues, we'll need to refactor where openSourceEditor is defined.
+    // --- CORRECTED DELEGATED LISTENER for Source Editor Modals ---
+    // Handles clicks within the source editor, including the dynamic group filter button
+    if (UIElements.sourceEditorModal) {
+        UIElements.sourceEditorModal.addEventListener('click', async (e) => {
+            // Check if the "Select Groups" button was clicked
+            if (e.target.closest('#source-editor-filter-groups-btn')) {
+                console.log('[SETTINGS] "Select Groups" button clicked (via delegation).');
+                const btn = e.target;
+                // Store the original HTML content (using innerHTML as setButtonLoadingState uses it)
+                const originalContent = btn.innerHTML;
+
+
+                // Use setButtonLoadingState ---
+                // Show loading state *before* making the API call
+                setButtonLoadingState(btn, true, 'Fetching...');
+
+
+                const sourceType = currentSourceTypeForEditor; // Use state variable
+                const sourceId = UIElements.sourceEditorId.value; // Get source ID from the hidden input
+                const body = {
+                    type: sourceType,
+                    url: UIElements.sourceEditorUrl.value,
+                    xc: sourceType === 'xc' ? JSON.stringify({
+                        server: UIElements.sourceEditorXcUrl.value,
+                        username: UIElements.sourceEditorXcUsername.value,
+                        password: UIElements.sourceEditorXcPassword.value,
+                    }) : null,
+                    sourceId: sourceId // <-- ADD THIS LINE
+                };
+
+                if (sourceType === 'file') {
+                    showNotification('Group filtering is not available for local file sources.', true);
+
+                    setButtonLoadingState(btn, false, originalContent);
+                    return;
+                }
+                // Added check for file path when type is 'file' ---
+                if ((sourceType === 'url' && !body.url) ||
+                    (sourceType === 'xc' && (!body.xc || !JSON.parse(body.xc).server)) ||
+                    (sourceType === 'file' && !UIElements.sourceEditorFileInfo.textContent) // Check if file info is present
+                   ) {
+                    showNotification('Please enter a valid URL, XC server address, or ensure a file is selected before fetching groups.', true);
+                    // --- MODIFIED: Restore button state on early exit ---
+                    setButtonLoadingState(btn, false, originalContent);
+
+                    return;
+                }
+
+
+
+                console.log('[SETTINGS] Fetching groups with body:', body);
+
+                try {
+                    const res = await apiFetch('/api/sources/fetch-groups', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        // Body now correctly includes sourceId
+                        body: JSON.stringify(body)
+                    });
+
+                    if (res && res.ok) {
+                        const data = await res.json();
+                        console.log('[SETTINGS] Groups fetched successfully:', data.groups); // 
+                        const selectedGroupsInput = document.getElementById('source-editor-selected-groups');
+                        const currentlySelected = selectedGroupsInput ? JSON.parse(selectedGroupsInput.value || '[]') : [];
+
+                        // Ensure helper function exists before calling
+                        if (typeof populateGroupFilterModal === 'function') {
+                            populateGroupFilterModal(data.groups || [], currentlySelected);
+                            openModal(UIElements.groupFilterModal);
+                        } else {
+                            console.error('[SETTINGS] populateGroupFilterModal function not found!');
+                            showNotification('UI Error: Cannot display group filter.', true);
+                        }
+                    } else {
+                        console.error('[SETTINGS] Failed to fetch groups. Response:', res); // 
+                        // apiFetch shows notification
+                    }
+                } catch (fetchError) {
+                    console.error('[SETTINGS] Error during fetch-groups API call:', fetchError);
+                    showNotification('An error occurred while trying to fetch groups.', true);
+                } finally {
+                    // Restore button state regardless of success or failure
+                    setButtonLoadingState(btn, false, originalContent);
+                }
+                
+            }
+            // Handle Refresh Groups button ---
+            else if (e.target.closest('#source-editor-refresh-groups-btn')) { // Use closest for icon clicks
+                console.log('[SETTINGS] "Refresh Groups" button clicked.');
+                const btn = e.target.closest('#source-editor-refresh-groups-btn'); // Get the button element
+                const originalContent = btn.innerHTML; // Store original icon HTML
+                setButtonLoadingState(btn, true, ''); // Show spinner (no text needed for icon button)
+
+                const sourceType = currentSourceTypeForEditor;
+                const sourceId = UIElements.sourceEditorId.value; // Get source ID being edited
+                const body = {
+                    type: sourceType,
+                    url: UIElements.sourceEditorUrl.value,
+                    xc: sourceType === 'xc' ? JSON.stringify({
+                        server: UIElements.sourceEditorXcUrl.value,
+                        username: UIElements.sourceEditorXcUsername.value,
+                        password: UIElements.sourceEditorXcPassword.value,
+                    }) : null,
+                    refresh: true, // Tell the backend to force refresh
+                    sourceId: sourceId // Pass sourceId for cache update
+                };
+
+                 if (sourceType === 'file') {
+                    showNotification('Cannot refresh groups for local file sources.', true);
+                    setButtonLoadingState(btn, false, originalContent);
+                    return;
+                }
+                 if ((sourceType === 'url' && !body.url) || (sourceType === 'xc' && (!body.xc || !JSON.parse(body.xc).server))) {
+                    showNotification('Please enter a valid URL or XC server address before refreshing groups.', true);
+                    setButtonLoadingState(btn, false, originalContent);
+                    return;
+                }
+
+                console.log('[SETTINGS] Refreshing groups with body:', body);
+
+                try {
+                    const res = await apiFetch('/api/sources/fetch-groups', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        // Body now correctly includes sourceId and refresh flag
+                        body: JSON.stringify(body)
+                    });
+
+                    if (res && res.ok) {
+                        const data = await res.json();
+                        showNotification(`Groups refreshed successfully (${data.groups.length} found).`, false);
+                        // Optionally, auto-open the select modal after refresh:
+                        // const selectedGroupsInput = document.getElementById('source-editor-selected-groups');
+                        // const currentlySelected = selectedGroupsInput ? JSON.parse(selectedGroupsInput.value || '[]') : [];
+                        // populateGroupFilterModal(data.groups || [], currentlySelected);
+                        // openModal(UIElements.groupFilterModal);
+                    } // apiFetch handles errors
+                } catch (fetchError) {
+                    console.error('[SETTINGS] Error during group refresh API call:', fetchError);
+                    showNotification('An error occurred while refreshing groups.', true);
+                } finally {
+                    setButtonLoadingState(btn, false, originalContent); // Restore icon
+                }
+            }
+            
+        });
+        console.log('[SETTINGS] Added delegated click listener to source editor modal.');
+    } else {
+         console.error('[SETTINGS] Cannot add delegated listener: Source Editor Modal element not found.');
+    }
+            
+            // Add other delegated click handlers for the source editor modal here if needed
+
+    // Make sure helper functions are defined outside or properly imported/accessible
+    // Assuming populateGroupFilterModal and updateGroupFilterList are defined elsewhere in settings.js
+
+}; // Closing brace for setupSettingsEventListeners (ensure this matches your file structure)
 
