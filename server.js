@@ -23,10 +23,14 @@ const webpush = require('web-push');
 const schedule = require('node-schedule');
 const disk = require('diskusage');
 const si = require('systeminformation'); // NEW: For system health monitoring
+const { Issuer, generators } = require('openid-client'); // OIDC support
 //vod processor
 const { refreshVodContent, processM3uVod } = require('./vodProcessor');
 const XtreamClient = require('./xtreamClient');
 
+// --- OIDC Client Cache ---
+let oidcClient = null;
+let oidcClientInitPromise = null;
 
 // --- NEW: Live Activity Tracking for Redirects ---
 const activeRedirectStreams = new Map(); // Tracks live redirect streams for the admin UI
@@ -60,8 +64,9 @@ const activeStreamProcesses = new Map();
 const STREAM_INACTIVITY_TIMEOUT = 30000; // 30 seconds to kill an inactive stream process
 
 // --- Configuration ---
-const DATA_DIR = '/data';
-const DVR_DIR = '/dvr';
+// Use environment variables for data directories (Docker sets these), fallback to local paths for development
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DVR_DIR = process.env.DVR_DIR || path.join(__dirname, 'dvr');
 const LOGS_DIR = path.join(DATA_DIR, 'logs'); // NEW: Log management directory
 const VAPID_KEYS_PATH = path.join(DATA_DIR, 'vapid.json');
 const SOURCES_DIR = path.join(DATA_DIR, 'sources');
@@ -731,6 +736,23 @@ function getSettings() {
             maxFiles: 5,
             maxFileSizeBytes: 5 * 1024 * 1024, // 5MB
             autoDeleteDays: 7
+        },
+        // OIDC (OpenID Connect) SSO Configuration
+        oidc: {
+            enabled: false,
+            issuerUrl: '',           // e.g., https://accounts.google.com or https://login.microsoftonline.com/{tenant}/v2.0
+            clientId: '',
+            clientSecret: '',
+            redirectUri: '',         // e.g., http://localhost:8998/api/auth/oidc/callback
+            scopes: 'openid profile email',
+            autoCreateUsers: true,   // Auto-create users on first OIDC login
+            defaultIsAdmin: false,   // New OIDC users are not admins by default
+            defaultCanUseDvr: true,  // New OIDC users can use DVR by default
+            buttonText: 'Login with SSO',
+            claimMapping: {
+                username: 'preferred_username', // or 'email', 'sub', etc.
+                email: 'email'
+            }
         }
     };
 
@@ -859,6 +881,28 @@ function getSettings() {
             if (settings.logs.autoDeleteDays === undefined) {
                 console.log(`[SETTINGS_MIGRATE] Adding missing logs.autoDeleteDays setting.`);
                 settings.logs.autoDeleteDays = defaultSettings.logs.autoDeleteDays;
+                needsSave = true;
+            }
+        }
+
+        // NEW: OIDC settings migration
+        if (!settings.oidc) {
+            console.log(`[SETTINGS_MIGRATE] Initializing missing OIDC settings block.`);
+            settings.oidc = defaultSettings.oidc;
+            needsSave = true;
+        } else {
+            // Ensure all OIDC sub-settings exist
+            const oidcDefaults = defaultSettings.oidc;
+            for (const key of Object.keys(oidcDefaults)) {
+                if (settings.oidc[key] === undefined) {
+                    console.log(`[SETTINGS_MIGRATE] Adding missing oidc.${key} setting.`);
+                    settings.oidc[key] = oidcDefaults[key];
+                    needsSave = true;
+                }
+            }
+            // Ensure claimMapping sub-object exists
+            if (!settings.oidc.claimMapping) {
+                settings.oidc.claimMapping = oidcDefaults.claimMapping;
                 needsSave = true;
             }
         }
@@ -1704,6 +1748,265 @@ app.post('/api/auth/logout', (req, res) => {
         console.log(`[AUTH_API] User ${username} logged out. Session destroyed.`);
         res.json({ success: true });
     });
+});
+
+// --- OIDC (OpenID Connect) Authentication Routes ---
+
+/**
+ * Initialize or retrieve the OIDC client.
+ * Uses lazy initialization and caches the client.
+ */
+async function getOidcClient() {
+    const settings = getSettings();
+    const oidcConfig = settings.oidc;
+
+    if (!oidcConfig.enabled || !oidcConfig.issuerUrl || !oidcConfig.clientId || !oidcConfig.clientSecret) {
+        return null;
+    }
+
+    // Return cached client if available and config hasn't changed
+    if (oidcClient && oidcClient._issuerUrl === oidcConfig.issuerUrl && oidcClient._clientId === oidcConfig.clientId) {
+        return oidcClient;
+    }
+
+    // If already initializing, wait for it
+    if (oidcClientInitPromise) {
+        return oidcClientInitPromise;
+    }
+
+    oidcClientInitPromise = (async () => {
+        try {
+            console.log(`[OIDC] Discovering issuer at: ${oidcConfig.issuerUrl}`);
+            const issuer = await Issuer.discover(oidcConfig.issuerUrl);
+            console.log(`[OIDC] Discovered issuer: ${issuer.metadata.issuer}`);
+
+            oidcClient = new issuer.Client({
+                client_id: oidcConfig.clientId,
+                client_secret: oidcConfig.clientSecret,
+                redirect_uris: [oidcConfig.redirectUri],
+                response_types: ['code'],
+            });
+
+            // Store config used for cache invalidation
+            oidcClient._issuerUrl = oidcConfig.issuerUrl;
+            oidcClient._clientId = oidcConfig.clientId;
+
+            return oidcClient;
+        } catch (err) {
+            console.error('[OIDC] Failed to discover issuer:', err.message);
+            oidcClient = null;
+            throw err;
+        } finally {
+            oidcClientInitPromise = null;
+        }
+    })();
+
+    return oidcClientInitPromise;
+}
+
+/**
+ * GET /api/auth/oidc/config - Returns public OIDC configuration for the frontend
+ */
+app.get('/api/auth/oidc/config', (req, res) => {
+    const settings = getSettings();
+    const oidcConfig = settings.oidc;
+
+    res.json({
+        enabled: oidcConfig.enabled,
+        buttonText: oidcConfig.buttonText || 'Login with SSO'
+    });
+});
+
+/**
+ * GET /api/auth/oidc/login - Initiates the OIDC login flow
+ */
+app.get('/api/auth/oidc/login', async (req, res) => {
+    try {
+        const client = await getOidcClient();
+        if (!client) {
+            return res.status(400).json({ error: 'OIDC is not configured or enabled.' });
+        }
+
+        const settings = getSettings();
+        const oidcConfig = settings.oidc;
+
+        // Generate state and nonce for security
+        const state = generators.state();
+        const nonce = generators.nonce();
+
+        // Store state and nonce in session for validation
+        req.session.oidcState = state;
+        req.session.oidcNonce = nonce;
+
+        const authUrl = client.authorizationUrl({
+            scope: oidcConfig.scopes || 'openid profile email',
+            state,
+            nonce,
+        });
+
+        console.log(`[OIDC] Redirecting to authorization URL`);
+        res.redirect(authUrl);
+    } catch (err) {
+        console.error('[OIDC] Login initiation failed:', err.message);
+        res.redirect('/?error=oidc_init_failed');
+    }
+});
+
+/**
+ * GET /api/auth/oidc/callback - Handles the OIDC callback after authentication
+ */
+app.get('/api/auth/oidc/callback', async (req, res) => {
+    try {
+        const client = await getOidcClient();
+        if (!client) {
+            return res.redirect('/?error=oidc_not_configured');
+        }
+
+        const settings = getSettings();
+        const oidcConfig = settings.oidc;
+
+        // Get the callback params from the URL
+        const params = client.callbackParams(req);
+
+        // Validate state
+        if (params.state !== req.session.oidcState) {
+            console.error('[OIDC] State mismatch - possible CSRF attack');
+            return res.redirect('/?error=oidc_state_mismatch');
+        }
+
+        // Exchange code for tokens
+        const tokenSet = await client.callback(oidcConfig.redirectUri, params, {
+            state: req.session.oidcState,
+            nonce: req.session.oidcNonce,
+        });
+
+        // Clear OIDC session data
+        delete req.session.oidcState;
+        delete req.session.oidcNonce;
+
+        // Get user info from the ID token or userinfo endpoint
+        const claims = tokenSet.claims();
+        console.log('[OIDC] Token claims received:', Object.keys(claims).join(', '));
+
+        // Extract username based on claim mapping
+        const usernameClaimPath = oidcConfig.claimMapping?.username || 'preferred_username';
+        let oidcUsername = claims[usernameClaimPath] || claims.email || claims.sub;
+
+        if (!oidcUsername) {
+            console.error('[OIDC] Could not determine username from claims');
+            return res.redirect('/?error=oidc_no_username');
+        }
+
+        // Normalize username (lowercase, remove domain if email)
+        oidcUsername = oidcUsername.toLowerCase();
+        if (oidcUsername.includes('@') && usernameClaimPath !== 'email') {
+            oidcUsername = oidcUsername.split('@')[0];
+        }
+
+        console.log(`[OIDC] Authenticated user: ${oidcUsername}`);
+
+        // Check if user exists in database
+        // Helper function to send popup response
+        const sendPopupResponse = (success, error = null) => {
+            const html = `
+<!DOCTYPE html>
+<html>
+<head><title>SSO Login</title></head>
+<body>
+<script>
+    if (window.opener) {
+        window.opener.postMessage({ type: 'oidc-callback', success: ${success}, error: ${error ? `'${error}'` : 'null'} }, window.location.origin);
+        window.close();
+    } else {
+        window.location.href = '/${error ? `?error=${error}` : ''}';
+    }
+</script>
+<p>Authentication ${success ? 'successful' : 'failed'}. This window should close automatically.</p>
+<p>If it doesn't, <a href="/">click here</a> to continue.</p>
+</body>
+</html>`;
+            res.send(html);
+        };
+
+        db.get("SELECT * FROM users WHERE username = ?", [oidcUsername], async (err, user) => {
+            if (err) {
+                console.error('[OIDC] Database error:', err);
+                return sendPopupResponse(false, 'oidc_db_error');
+            }
+
+            if (user) {
+                // User exists - log them in
+                req.session.userId = user.id;
+                req.session.username = user.username;
+                req.session.isAdmin = user.isAdmin === 1;
+                req.session.canUseDvr = user.canUseDvr === 1;
+                req.session.oidcLogin = true;
+                console.log(`[OIDC] Existing user "${oidcUsername}" logged in via OIDC`);
+                return sendPopupResponse(true);
+            }
+
+            // User doesn't exist - check if auto-create is enabled
+            if (!oidcConfig.autoCreateUsers) {
+                console.warn(`[OIDC] User "${oidcUsername}" not found and auto-create is disabled`);
+                return sendPopupResponse(false, 'oidc_user_not_found');
+            }
+
+            // Auto-create the user
+            const isAdmin = oidcConfig.defaultIsAdmin ? 1 : 0;
+            const canUseDvr = oidcConfig.defaultCanUseDvr ? 1 : 0;
+            // Generate a random password (user won't use it - they'll use OIDC)
+            const randomPassword = crypto.randomBytes(32).toString('hex');
+
+            bcrypt.hash(randomPassword, 10, (hashErr, hash) => {
+                if (hashErr) {
+                    console.error('[OIDC] Error hashing password:', hashErr);
+                    return sendPopupResponse(false, 'oidc_create_failed');
+                }
+
+                db.run(
+                    "INSERT INTO users (username, password, isAdmin, canUseDvr) VALUES (?, ?, ?, ?)",
+                    [oidcUsername, hash, isAdmin, canUseDvr],
+                    function(insertErr) {
+                        if (insertErr) {
+                            console.error('[OIDC] Error creating user:', insertErr);
+                            return sendPopupResponse(false, 'oidc_create_failed');
+                        }
+
+                        const newUserId = this.lastID;
+                        req.session.userId = newUserId;
+                        req.session.username = oidcUsername;
+                        req.session.isAdmin = isAdmin === 1;
+                        req.session.canUseDvr = canUseDvr === 1;
+                        req.session.oidcLogin = true;
+
+                        console.log(`[OIDC] Created new user "${oidcUsername}" (ID: ${newUserId}) via OIDC`);
+                        return sendPopupResponse(true);
+                    }
+                );
+            });
+        });
+    } catch (err) {
+        console.error('[OIDC] Callback error:', err.message);
+        // For errors before we can use sendPopupResponse helper
+        const html = `
+<!DOCTYPE html>
+<html>
+<head><title>SSO Login</title></head>
+<body>
+<script>
+    if (window.opener) {
+        window.opener.postMessage({ type: 'oidc-callback', success: false, error: 'oidc_callback_failed' }, window.location.origin);
+        window.close();
+    } else {
+        window.location.href = '/?error=oidc_callback_failed';
+    }
+</script>
+<p>Authentication failed. This window should close automatically.</p>
+<p>If it doesn't, <a href="/">click here</a> to continue.</p>
+</body>
+</html>`;
+        res.send(html);
+    }
 });
 
 // --- NEW/OPTIMIZED ENDPOINT FOR GROUP FILTERING (with Caching & Refresh) ---
@@ -2966,6 +3269,7 @@ app.post('/api/save/settings', requireAuth, async (req, res) => {
         let currentSettings = getSettings();
 
         const oldTimezone = currentSettings.timezoneOffset;
+        const oldOidcConfig = JSON.stringify(currentSettings.oidc || {});
 
         const updatedSettings = { ...currentSettings };
         for (const key in req.body) {
@@ -2977,6 +3281,14 @@ app.post('/api/save/settings', requireAuth, async (req, res) => {
         }
 
         saveSettings(updatedSettings);
+
+        // Invalidate OIDC client cache if OIDC settings changed
+        const newOidcConfig = JSON.stringify(updatedSettings.oidc || {});
+        if (newOidcConfig !== oldOidcConfig) {
+            console.log('[API] OIDC settings changed, invalidating client cache.');
+            oidcClient = null;
+            oidcClientInitPromise = null;
+        }
 
         if (updatedSettings.timezoneOffset !== oldTimezone) {
             console.log("[API] Timezone setting changed, re-processing sources.");
