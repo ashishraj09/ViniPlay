@@ -23,13 +23,13 @@ const webpush = require('web-push');
 const schedule = require('node-schedule');
 const disk = require('diskusage');
 const si = require('systeminformation'); // NEW: For system health monitoring
-const { Issuer, generators } = require('openid-client'); // OIDC support
+const openidClient = require('openid-client'); // OIDC support (v6 API)
 //vod processor
 const { refreshVodContent, processM3uVod } = require('./vodProcessor');
 const XtreamClient = require('./xtreamClient');
 
 // --- OIDC Client Cache ---
-let oidcClient = null;
+let oidcConfig_cached = null;
 let oidcClientInitPromise = null;
 
 // --- NEW: Live Activity Tracking for Redirects ---
@@ -1753,20 +1753,23 @@ app.post('/api/auth/logout', (req, res) => {
 // --- OIDC (OpenID Connect) Authentication Routes ---
 
 /**
- * Initialize or retrieve the OIDC client.
- * Uses lazy initialization and caches the client.
+ * Initialize or retrieve the OIDC configuration.
+ * Uses lazy initialization and caches the config.
+ * Returns the openid-client configuration object for use with v6 API.
  */
 async function getOidcClient() {
     const settings = getSettings();
-    const oidcConfig = settings.oidc;
+    const oidcSettings = settings.oidc;
 
-    if (!oidcConfig.enabled || !oidcConfig.issuerUrl || !oidcConfig.clientId || !oidcConfig.clientSecret) {
+    if (!oidcSettings.enabled || !oidcSettings.issuerUrl || !oidcSettings.clientId || !oidcSettings.clientSecret) {
         return null;
     }
 
-    // Return cached client if available and config hasn't changed
-    if (oidcClient && oidcClient._issuerUrl === oidcConfig.issuerUrl && oidcClient._clientId === oidcConfig.clientId) {
-        return oidcClient;
+    // Return cached config if available and settings haven't changed
+    if (oidcConfig_cached && 
+        oidcConfig_cached._issuerUrl === oidcSettings.issuerUrl && 
+        oidcConfig_cached._clientId === oidcSettings.clientId) {
+        return oidcConfig_cached;
     }
 
     // If already initializing, wait for it
@@ -1776,25 +1779,24 @@ async function getOidcClient() {
 
     oidcClientInitPromise = (async () => {
         try {
-            console.log(`[OIDC] Discovering issuer at: ${oidcConfig.issuerUrl}`);
-            const issuer = await Issuer.discover(oidcConfig.issuerUrl);
-            console.log(`[OIDC] Discovered issuer: ${issuer.metadata.issuer}`);
+            console.log(`[OIDC] Discovering issuer at: ${oidcSettings.issuerUrl}`);
+            const config = await openidClient.discovery(
+                new URL(oidcSettings.issuerUrl),
+                oidcSettings.clientId,
+                oidcSettings.clientSecret
+            );
+            console.log(`[OIDC] Discovered issuer: ${config.serverMetadata().issuer}`);
 
-            oidcClient = new issuer.Client({
-                client_id: oidcConfig.clientId,
-                client_secret: oidcConfig.clientSecret,
-                redirect_uris: [oidcConfig.redirectUri],
-                response_types: ['code'],
-            });
+            // Cache the config with metadata for invalidation
+            oidcConfig_cached = config;
+            oidcConfig_cached._issuerUrl = oidcSettings.issuerUrl;
+            oidcConfig_cached._clientId = oidcSettings.clientId;
+            oidcConfig_cached._redirectUri = oidcSettings.redirectUri;
 
-            // Store config used for cache invalidation
-            oidcClient._issuerUrl = oidcConfig.issuerUrl;
-            oidcClient._clientId = oidcConfig.clientId;
-
-            return oidcClient;
+            return oidcConfig_cached;
         } catch (err) {
             console.error('[OIDC] Failed to discover issuer:', err.message);
-            oidcClient = null;
+            oidcConfig_cached = null;
             throw err;
         } finally {
             oidcClientInitPromise = null;
@@ -1822,30 +1824,38 @@ app.get('/api/auth/oidc/config', (req, res) => {
  */
 app.get('/api/auth/oidc/login', async (req, res) => {
     try {
-        const client = await getOidcClient();
-        if (!client) {
+        const config = await getOidcClient();
+        if (!config) {
             return res.status(400).json({ error: 'OIDC is not configured or enabled.' });
         }
 
         const settings = getSettings();
-        const oidcConfig = settings.oidc;
+        const oidcSettings = settings.oidc;
 
-        // Generate state and nonce for security
-        const state = generators.state();
-        const nonce = generators.nonce();
+        // Generate state, nonce, and PKCE code verifier for security (v6 API)
+        const state = openidClient.randomState();
+        const nonce = openidClient.randomNonce();
+        const codeVerifier = openidClient.randomPKCECodeVerifier();
+        const codeChallenge = await openidClient.calculatePKCECodeChallenge(codeVerifier);
 
-        // Store state and nonce in session for validation
+        // Store state, nonce, and code verifier in session for validation
         req.session.oidcState = state;
         req.session.oidcNonce = nonce;
+        req.session.oidcCodeVerifier = codeVerifier;
 
-        const authUrl = client.authorizationUrl({
-            scope: oidcConfig.scopes || 'openid profile email',
+        const parameters = {
+            redirect_uri: oidcSettings.redirectUri,
+            scope: oidcSettings.scopes || 'openid profile email',
             state,
             nonce,
-        });
+            code_challenge: codeChallenge,
+            code_challenge_method: 'S256',
+        };
+
+        const authUrl = openidClient.buildAuthorizationUrl(config, parameters);
 
         console.log(`[OIDC] Redirecting to authorization URL`);
-        res.redirect(authUrl);
+        res.redirect(authUrl.href);
     } catch (err) {
         console.error('[OIDC] Login initiation failed:', err.message);
         res.redirect('/?error=oidc_init_failed');
@@ -1857,39 +1867,42 @@ app.get('/api/auth/oidc/login', async (req, res) => {
  */
 app.get('/api/auth/oidc/callback', async (req, res) => {
     try {
-        const client = await getOidcClient();
-        if (!client) {
+        const config = await getOidcClient();
+        if (!config) {
             return res.redirect('/?error=oidc_not_configured');
         }
 
         const settings = getSettings();
-        const oidcConfig = settings.oidc;
+        const oidcSettings = settings.oidc;
 
-        // Get the callback params from the URL
-        const params = client.callbackParams(req);
+        // Build the current URL for token exchange
+        const currentUrl = new URL(req.protocol + '://' + req.get('host') + req.originalUrl);
 
-        // Validate state
-        if (params.state !== req.session.oidcState) {
+        // Validate state from URL params
+        const urlState = currentUrl.searchParams.get('state');
+        if (urlState !== req.session.oidcState) {
             console.error('[OIDC] State mismatch - possible CSRF attack');
             return res.redirect('/?error=oidc_state_mismatch');
         }
 
-        // Exchange code for tokens
-        const tokenSet = await client.callback(oidcConfig.redirectUri, params, {
-            state: req.session.oidcState,
-            nonce: req.session.oidcNonce,
+        // Exchange code for tokens (with PKCE code_verifier) using v6 API
+        const tokenSet = await openidClient.authorizationCodeGrant(config, currentUrl, {
+            pkceCodeVerifier: req.session.oidcCodeVerifier,
+            expectedNonce: req.session.oidcNonce,
+            expectedState: req.session.oidcState,
         });
 
         // Clear OIDC session data
         delete req.session.oidcState;
         delete req.session.oidcNonce;
+        delete req.session.oidcCodeVerifier;
 
-        // Get user info from the ID token or userinfo endpoint
+        // Get user info from the ID token claims (v6 API)
         const claims = tokenSet.claims();
         console.log('[OIDC] Token claims received:', Object.keys(claims).join(', '));
 
         // Extract username based on claim mapping
-        const usernameClaimPath = oidcConfig.claimMapping?.username || 'preferred_username';
+        const usernameClaimPath = oidcSettings.claimMapping?.username || 'preferred_username';
         let oidcUsername = claims[usernameClaimPath] || claims.email || claims.sub;
 
         if (!oidcUsername) {
@@ -1946,14 +1959,14 @@ app.get('/api/auth/oidc/callback', async (req, res) => {
             }
 
             // User doesn't exist - check if auto-create is enabled
-            if (!oidcConfig.autoCreateUsers) {
+            if (!oidcSettings.autoCreateUsers) {
                 console.warn(`[OIDC] User "${oidcUsername}" not found and auto-create is disabled`);
                 return sendPopupResponse(false, 'oidc_user_not_found');
             }
 
             // Auto-create the user
-            const isAdmin = oidcConfig.defaultIsAdmin ? 1 : 0;
-            const canUseDvr = oidcConfig.defaultCanUseDvr ? 1 : 0;
+            const isAdmin = oidcSettings.defaultIsAdmin ? 1 : 0;
+            const canUseDvr = oidcSettings.defaultCanUseDvr ? 1 : 0;
             // Generate a random password (user won't use it - they'll use OIDC)
             const randomPassword = crypto.randomBytes(32).toString('hex');
 
@@ -1987,6 +2000,7 @@ app.get('/api/auth/oidc/callback', async (req, res) => {
         });
     } catch (err) {
         console.error('[OIDC] Callback error:', err.message);
+        console.error('[OIDC] Callback error stack:', err.stack);
         // For errors before we can use sendPopupResponse helper
         const html = `
 <!DOCTYPE html>
@@ -3286,7 +3300,7 @@ app.post('/api/save/settings', requireAuth, async (req, res) => {
         const newOidcConfig = JSON.stringify(updatedSettings.oidc || {});
         if (newOidcConfig !== oldOidcConfig) {
             console.log('[API] OIDC settings changed, invalidating client cache.');
-            oidcClient = null;
+            oidcConfig_cached = null;
             oidcClientInitPromise = null;
         }
 
